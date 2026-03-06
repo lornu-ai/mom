@@ -9,7 +9,9 @@ use std::sync::Arc;
 use surrealdb::engine::local::Db;
 use surrealdb::sql::Thing;
 use surrealdb::Surreal;
-use tracing::{debug, warn};
+use tracing::debug;
+
+pub mod hybrid;
 
 pub struct SurrealDBStore {
     db: Arc<Surreal<Db>>,
@@ -48,8 +50,9 @@ struct StoredItem {
 }
 
 impl SurrealDBStore {
-    pub async fn new(db_path: &str) -> anyhow::Result<Self> {
-        let db = Surreal::new::<Db>(db_path).await?;
+    pub async fn new(_db_path: &str) -> anyhow::Result<Self> {
+        // For in-memory backend, create new Surreal instance
+        let db = Surreal::new::<Db>(()).await?;
         db.use_ns("mom").use_db("main").await?;
 
         Self::init_schema(&db).await?;
@@ -147,23 +150,24 @@ impl mom_core::MemoryStore for SurrealDBStore {
             embedding_model: item.embedding_model.clone(),
         };
 
-        let _: Option<Thing> = self
-            .db
-            .upsert(("memory_items", &item.id.0))
-            .content(stored)
-            .await?;
+        // Upsert using MERGE statement
+        let query = format!(
+            "UPSERT memory_items:{} MERGE {}",
+            item.id.0,
+            serde_json::to_string(&stored)?
+        );
+
+        let _: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
 
         debug!("Stored memory item: {}", item.id.0);
         Ok(())
     }
 
     async fn get(&self, id: &MemoryId) -> anyhow::Result<Option<MemoryItem>> {
-        let stored: Option<StoredItem> = self
-            .db
-            .select(("memory_items", &id.0))
-            .await?;
+        let query = format!("SELECT * FROM memory_items:{}", id.0);
+        let results: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
 
-        Ok(stored.map(|s| {
+        Ok(results.into_iter().next().map(|s| {
             let content = match (s.content_text, s.content_json) {
                 (Some(text), None) => Content::Text(text),
                 (None, Some(json)) => Content::Json(json),
@@ -296,7 +300,8 @@ impl mom_core::MemoryStore for SurrealDBStore {
     }
 
     async fn delete(&self, id: &MemoryId) -> anyhow::Result<()> {
-        let _: Option<Thing> = self.db.delete(("memory_items", &id.0)).await?;
+        let query = format!("DELETE memory_items:{}", id.0);
+        let _: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
         debug!("Deleted memory item: {}", id.0);
         Ok(())
     }
