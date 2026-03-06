@@ -2090,6 +2090,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mom-sources"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "mom-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mom-store-surrealdb"
 version = "0.1.0"
 dependencies = [
