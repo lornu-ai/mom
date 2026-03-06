@@ -6,7 +6,7 @@
 use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, Query, Scored};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use surrealdb::engine::local::Db;
+use surrealdb::engine::local::{Db, Mem};
 use surrealdb::sql::Thing;
 use surrealdb::Surreal;
 use tracing::debug;
@@ -52,7 +52,8 @@ struct StoredItem {
 impl SurrealDBStore {
     pub async fn new(_db_path: &str) -> anyhow::Result<Self> {
         // For in-memory backend, create new Surreal instance
-        let db = Surreal::new::<Db>(()).await?;
+        // Note: Initialize with Mem endpoint, returns Surreal<Db> connection
+        let db: Surreal<Db> = Surreal::new::<Mem>(()).await?;
         db.use_ns("mom").use_db("main").await?;
 
         Self::init_schema(&db).await?;
