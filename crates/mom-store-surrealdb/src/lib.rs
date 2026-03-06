@@ -39,6 +39,12 @@ struct StoredItem {
     meta: serde_json::Value,
 
     tags: Vec<String>,
+
+    // Phase 2: Vector embeddings
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedding_model: Option<String>,
 }
 
 impl SurrealDBStore {
@@ -77,9 +83,12 @@ impl SurrealDBStore {
             DEFINE FIELD ttl_ms ON TABLE memory_items TYPE option<number>;
             DEFINE FIELD meta ON TABLE memory_items TYPE object;
             DEFINE FIELD tags ON TABLE memory_items TYPE array<string>;
+            DEFINE FIELD embedding ON TABLE memory_items TYPE option<array<float>>;
+            DEFINE FIELD embedding_model ON TABLE memory_items TYPE option<string>;
 
             DEFINE INDEX idx_tenant_time ON TABLE memory_items COLUMNS tenant_id, created_at_ms;
             DEFINE INDEX idx_scope ON TABLE memory_items COLUMNS tenant_id, workspace_id, project_id, agent_id, run_id;
+            DEFINE INDEX idx_embedding ON TABLE memory_items COLUMNS embedding;
             "#
         )
         .await?;
@@ -134,6 +143,8 @@ impl mom_core::MemoryStore for SurrealDBStore {
             ttl_ms: item.ttl_ms,
             meta: serde_json::to_value(&item.meta)?,
             tags: item.tags.clone(),
+            embedding: item.embedding.clone(),
+            embedding_model: item.embedding_model.clone(),
         };
 
         let _: Option<Thing> = self
@@ -180,6 +191,8 @@ impl mom_core::MemoryStore for SurrealDBStore {
                 source: s.source,
                 ttl_ms: s.ttl_ms,
                 meta: serde_json::from_value(s.meta).unwrap_or_default(),
+                embedding: s.embedding,
+                embedding_model: s.embedding_model,
             }
         }))
     }
@@ -272,6 +285,8 @@ impl mom_core::MemoryStore for SurrealDBStore {
                     source: item.source,
                     ttl_ms: item.ttl_ms,
                     meta: serde_json::from_value(item.meta).unwrap_or_default(),
+                    embedding: item.embedding,
+                    embedding_model: item.embedding_model,
                 },
             });
         }

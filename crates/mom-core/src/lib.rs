@@ -54,6 +54,10 @@ pub struct MemoryItem {
     pub source: String,    // "user" | "tool" | "agent" | "system"
     pub ttl_ms: Option<i64>,
     pub meta: BTreeMap<String, serde_json::Value>,
+
+    // semantic search (Phase 2)
+    pub embedding: Option<Vec<f32>>,
+    pub embedding_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +86,28 @@ pub trait MemoryStore: Send + Sync {
     async fn get(&self, id: &MemoryId) -> anyhow::Result<Option<MemoryItem>>;
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>>;
     async fn delete(&self, id: &MemoryId) -> anyhow::Result<()>;
+
+    /// Vector-based semantic search (Phase 2)
+    async fn vector_recall(
+        &self,
+        query_embedding: &[f32],
+        scope: &ScopeKey,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
+        // Default implementation returns empty - implementations can override
+        Ok(Vec::new())
+    }
+
+    /// Hybrid recall combining lexical + semantic search with RRF fusion (Phase 2)
+    async fn hybrid_recall(
+        &self,
+        q: Query,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
+        // Default implementation returns empty - implementations can override
+        Ok(Vec::new())
+    }
 }
 
 /// Optional: embedder for semantic search (plug in later)
@@ -112,6 +138,8 @@ impl MemoryItem {
             source,
             ttl_ms: None,
             meta: BTreeMap::new(),
+            embedding: None,
+            embedding_model: None,
         }
     }
 }

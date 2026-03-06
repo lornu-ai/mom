@@ -3,7 +3,7 @@ members = [
   "crates/mom-core",
   "crates/mom-store-surrealdb",
   "crates/mom-service",
-  "crates/mom-cli",
+  "crates/mom-embeddings",
 ]
 resolver = "2"
 
