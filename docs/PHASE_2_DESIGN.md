@@ -337,9 +337,9 @@ benchmark_hybrid_recall_100k_items()
 
 ## Rollout Plan
 
-### Phase 2a: Vector Foundations (Issue #10)
+### Phase 2a: Vector Foundations (Issue #10) ✅
 - Add embedding field to data model
-- Implement embedding providers
+- Implement embedding providers (Ollama, Mistral, OpenAI)
 - Store embeddings in SurrealDB
 
 ### Phase 2b: Hybrid Search (Issue #12)
@@ -347,7 +347,14 @@ benchmark_hybrid_recall_100k_items()
 - Implement hybrid_recall with RRF fusion
 - Benchmark and tune
 
-### Phase 2c: Optimization (Future)
+### Phase 2c: Multi-Source Ingestion (Issue #29)
+- Define ingestion protocol for external sources
+- Implement oxidizedRAG connector (code memories)
+- Implement oxidizedgraph connector (workflow/decision memories)
+- Implement data-fabric connector (fact/knowledge memories)
+- Route ingested data to appropriate memory types
+
+### Phase 2d: Optimization (Future)
 - Vector index tuning
 - Batch embedding for background jobs
 - Caching layer for repeated queries
