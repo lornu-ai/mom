@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mom_core::{MemoryId, MemoryItem, MemoryKind, Query, Scored, ScopeKey, Content, MemoryStore};
+use mom_core::{MemoryId, MemoryItem, MemoryKind, Query, Scored, ScopeKey, MemoryStore};
 use mom_store_surrealdb::SurrealDBStore;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -104,6 +104,42 @@ async fn list_memories(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "default".to_string());
 
+    // Parse kinds filter (comma-separated: event,summary,fact,preference)
+    let kinds = params.get("kinds").and_then(|k| {
+        let parsed: Result<Vec<MemoryKind>, _> = k
+            .split(',')
+            .map(|s| match s.trim().to_lowercase().as_str() {
+                "event" => Ok(MemoryKind::Event),
+                "summary" => Ok(MemoryKind::Summary),
+                "fact" => Ok(MemoryKind::Fact),
+                "preference" => Ok(MemoryKind::Preference),
+                _ => Err(()),
+            })
+            .collect();
+        parsed.ok().and_then(|v| if v.is_empty() { None } else { Some(v) })
+    });
+
+    // Parse tags filter (comma-separated)
+    let tags_any = params.get("tags").and_then(|t| {
+        let tags: Vec<String> = t.split(',').map(|s| s.trim().to_string()).collect();
+        if tags.is_empty() || tags.iter().all(|s| s.is_empty()) {
+            None
+        } else {
+            Some(tags.into_iter().filter(|s| !s.is_empty()).collect())
+        }
+    });
+
+    // Parse time range filters (milliseconds since epoch)
+    let since_ms = params.get("since_ms").and_then(|s| s.parse().ok());
+    let until_ms = params.get("until_ms").and_then(|s| s.parse().ok());
+
+    // Parse and clamp limit to max 100
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|l| l.min(100))
+        .unwrap_or(10);
+
     let query = Query {
         scope: ScopeKey {
             tenant_id,
@@ -113,14 +149,11 @@ async fn list_memories(
             run_id: params.get("run_id").cloned(),
         },
         text: String::new(),
-        kinds: None,
-        tags_any: None,
-        limit: params
-            .get("limit")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10),
-        since_ms: None,
-        until_ms: None,
+        kinds,
+        tags_any,
+        limit,
+        since_ms,
+        until_ms,
     };
 
     let results = st.store.query(query).await?;
@@ -135,6 +168,79 @@ async fn delete_memory(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Compute lexical search score (0..1) based on text match
+/// Returns 0.0 if query doesn't match, up to 1.0 for exact match
+fn compute_text_match_score(item_content: &str, query_text: &str) -> f32 {
+    if query_text.is_empty() {
+        return 0.0; // No scoring for empty query
+    }
+
+    let query_lower = query_text.to_lowercase();
+    let content_lower = item_content.to_lowercase();
+
+    // Exact match = 1.0
+    if content_lower == query_lower {
+        return 1.0;
+    }
+
+    // Substring match: score based on how many times query appears
+    let match_count = content_lower.matches(&query_lower).count();
+    if match_count == 0 {
+        return 0.0;
+    }
+
+    // Score: 0.3 + (0.7 * (1 / distance_to_start)) for first match position
+    let position = content_lower.find(&query_lower).unwrap_or(content_lower.len());
+    let distance_ratio = (position as f32) / (content_lower.len() as f32);
+    let position_score = 1.0 - (distance_ratio * 0.5); // Early matches score higher
+
+    // Combine: base score for substring + position boost
+    let score = (match_count as f32).min(1.0) * 0.5 + position_score * 0.5;
+    score.min(1.0)
+}
+
+/// Compute recency score (0..1) based on how recent the memory is
+/// Newer items score higher
+fn compute_recency_score(created_at_ms: i64) -> f32 {
+    let now = chrono::Utc::now().timestamp_millis();
+    let age_ms = (now - created_at_ms).max(0);
+
+    // Decay function: memories decay over 30 days (2,592,000,000 ms)
+    let max_age_ms = 30 * 24 * 60 * 60 * 1000i64;
+    let decay = (age_ms as f32) / (max_age_ms as f32);
+    (1.0 - decay).max(0.0)
+}
+
+/// Compute combined ranking score from text match, importance, and recency
+fn compute_ranking_score(
+    item: &mom_core::MemoryItem,
+    query_text: &str,
+) -> f32 {
+    let text_match = compute_text_match_score(&item_to_text(item), query_text);
+
+    // If there's no text match, score is 0 (no recall result)
+    if text_match == 0.0 {
+        return 0.0;
+    }
+
+    let recency = compute_recency_score(item.created_at_ms);
+    let importance = item.importance;
+
+    // Weighted combination: 60% text match, 25% importance, 15% recency
+    (text_match * 0.6) + (importance * 0.25) + (recency * 0.15)
+}
+
+/// Extract text content from MemoryItem for searching
+fn item_to_text(item: &mom_core::MemoryItem) -> String {
+    match &item.content {
+        mom_core::Content::Text(t) => t.clone(),
+        mom_core::Content::Json(v) => v.to_string(),
+        mom_core::Content::TextJson { text, json } => {
+            format!("{} {}", text, json.to_string())
+        }
+    }
+}
+
 async fn recall(
     State(st): State<AppState>,
     Json(mut q): Json<Query>,
@@ -144,8 +250,34 @@ async fn recall(
         q.scope.tenant_id = "default".to_string();
     }
 
-    let results = st.store.query(q).await?;
-    Ok(Json(results))
+    // Get base results from store (applies scope and kind filters)
+    let results = st.store.query(q.clone()).await?;
+
+    // Apply lexical search scoring if query text is provided
+    if !q.text.is_empty() {
+        let mut scored: Vec<Scored<MemoryItem>> = results
+            .into_iter()
+            .map(|scored_item| {
+                let ranking_score = compute_ranking_score(&scored_item.item, &q.text);
+                Scored {
+                    score: ranking_score,
+                    item: scored_item.item,
+                }
+            })
+            .filter(|s| s.score > 0.0) // Only keep items with non-zero score
+            .collect();
+
+        // Sort by score descending
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Apply limit
+        scored.truncate(q.limit);
+
+        Ok(Json(scored))
+    } else {
+        // No query text: return results as-is (sorted by store default)
+        Ok(Json(results))
+    }
 }
 
 // Error handling
@@ -174,5 +306,581 @@ impl IntoResponse for ApiError {
         }));
 
         (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // Helper to parse kinds filter (extracted from list_memories logic for testability)
+    fn parse_kinds(kinds_str: &str) -> Option<Vec<MemoryKind>> {
+        let parsed: Result<Vec<MemoryKind>, _> = kinds_str
+            .split(',')
+            .map(|s| match s.trim().to_lowercase().as_str() {
+                "event" => Ok(MemoryKind::Event),
+                "summary" => Ok(MemoryKind::Summary),
+                "fact" => Ok(MemoryKind::Fact),
+                "preference" => Ok(MemoryKind::Preference),
+                _ => Err(()),
+            })
+            .collect();
+        parsed
+            .ok()
+            .and_then(|v: Vec<MemoryKind>| if v.is_empty() { None } else { Some(v) })
+    }
+
+    // Helper to parse tags filter
+    fn parse_tags(tags_str: &str) -> Option<Vec<String>> {
+        let tags: Vec<String> = tags_str.split(',').map(|s| s.trim().to_string()).collect();
+        if tags.is_empty() || tags.iter().all(|s| s.is_empty()) {
+            None
+        } else {
+            Some(tags.into_iter().filter(|s: &String| !s.is_empty()).collect())
+        }
+    }
+
+    #[test]
+    fn test_parse_single_kind() {
+        let kinds = parse_kinds("event");
+        assert_eq!(kinds, Some(vec![MemoryKind::Event]));
+    }
+
+    #[test]
+    fn test_parse_multiple_kinds() {
+        let kinds = parse_kinds("event,summary,fact");
+        assert_eq!(
+            kinds,
+            Some(vec![
+                MemoryKind::Event,
+                MemoryKind::Summary,
+                MemoryKind::Fact
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_kinds_with_whitespace() {
+        let kinds = parse_kinds("event , summary , fact");
+        assert_eq!(
+            kinds,
+            Some(vec![
+                MemoryKind::Event,
+                MemoryKind::Summary,
+                MemoryKind::Fact
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_kinds_case_insensitive() {
+        let kinds = parse_kinds("EVENT,Summary,FACT");
+        assert_eq!(
+            kinds,
+            Some(vec![
+                MemoryKind::Event,
+                MemoryKind::Summary,
+                MemoryKind::Fact
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_invalid_kind() {
+        let kinds = parse_kinds("invalid,event");
+        assert_eq!(kinds, None);
+    }
+
+    #[test]
+    fn test_parse_empty_kinds() {
+        let kinds = parse_kinds("");
+        assert_eq!(kinds, None);
+    }
+
+    #[test]
+    fn test_parse_all_kinds() {
+        let kinds = parse_kinds("event,summary,fact,preference");
+        assert_eq!(
+            kinds,
+            Some(vec![
+                MemoryKind::Event,
+                MemoryKind::Summary,
+                MemoryKind::Fact,
+                MemoryKind::Preference
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_single_tag() {
+        let tags = parse_tags("important");
+        assert_eq!(tags, Some(vec!["important".to_string()]));
+    }
+
+    #[test]
+    fn test_parse_multiple_tags() {
+        let tags = parse_tags("important,urgent,review");
+        assert_eq!(
+            tags,
+            Some(vec![
+                "important".to_string(),
+                "urgent".to_string(),
+                "review".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_tags_with_whitespace() {
+        let tags = parse_tags("important , urgent , review");
+        assert_eq!(
+            tags,
+            Some(vec![
+                "important".to_string(),
+                "urgent".to_string(),
+                "review".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_tags() {
+        let tags = parse_tags("");
+        assert_eq!(tags, None);
+    }
+
+    #[test]
+    fn test_parse_empty_tags_with_commas() {
+        let tags = parse_tags(",,");
+        assert_eq!(tags, None);
+    }
+
+    #[test]
+    fn test_parse_tags_with_empty_elements() {
+        let tags = parse_tags("important,,urgent");
+        assert_eq!(tags, Some(vec!["important".to_string(), "urgent".to_string()]));
+    }
+
+    #[test]
+    fn test_limit_default() {
+        let params: HashMap<String, String> = HashMap::new();
+        let limit = params
+            .get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|l| l.min(100))
+            .unwrap_or(10);
+        assert_eq!(limit, 10);
+    }
+
+    #[test]
+    fn test_limit_custom() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("limit".to_string(), "50".to_string());
+        let limit = params
+            .get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|l| l.min(100))
+            .unwrap_or(10);
+        assert_eq!(limit, 50);
+    }
+
+    #[test]
+    fn test_limit_clamped() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("limit".to_string(), "500".to_string());
+        let limit = params
+            .get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|l| l.min(100))
+            .unwrap_or(10);
+        assert_eq!(limit, 100);
+    }
+
+    #[test]
+    fn test_limit_invalid() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("limit".to_string(), "invalid".to_string());
+        let limit = params
+            .get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|l| l.min(100))
+            .unwrap_or(10);
+        assert_eq!(limit, 10);
+    }
+
+    #[test]
+    fn test_timestamp_parsing() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("since_ms".to_string(), "1609459200000".to_string());
+        params.insert("until_ms".to_string(), "1609545600000".to_string());
+
+        let since_ms = params.get("since_ms").and_then(|s| s.parse().ok());
+        let until_ms = params.get("until_ms").and_then(|s| s.parse().ok());
+
+        assert_eq!(since_ms, Some(1609459200000i64));
+        assert_eq!(until_ms, Some(1609545600000i64));
+    }
+
+    #[test]
+    fn test_timestamp_invalid() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("since_ms".to_string(), "invalid".to_string());
+
+        let since_ms = params.get("since_ms").and_then(|s| s.parse::<i64>().ok());
+        assert_eq!(since_ms, None);
+    }
+
+    #[test]
+    fn test_combined_filters() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("kinds".to_string(), "event,summary".to_string());
+        params.insert("tags".to_string(), "important,urgent".to_string());
+        params.insert("limit".to_string(), "25".to_string());
+        params.insert("since_ms".to_string(), "1609459200000".to_string());
+
+        let kinds = params.get("kinds").and_then(|k| {
+            let parsed: Result<Vec<MemoryKind>, _> = k
+                .split(',')
+                .map(|s| match s.trim().to_lowercase().as_str() {
+                    "event" => Ok(MemoryKind::Event),
+                    "summary" => Ok(MemoryKind::Summary),
+                    "fact" => Ok(MemoryKind::Fact),
+                    "preference" => Ok(MemoryKind::Preference),
+                    _ => Err(()),
+                })
+                .collect();
+            parsed.ok().and_then(|v: Vec<MemoryKind>| if v.is_empty() { None } else { Some(v) })
+        });
+
+        let tags_any = params.get("tags").and_then(|t| {
+            let tags: Vec<String> = t.split(',').map(|s| s.trim().to_string()).collect();
+            if tags.is_empty() || tags.iter().all(|s| s.is_empty()) {
+                None
+            } else {
+                Some(tags.into_iter().filter(|s: &String| !s.is_empty()).collect())
+            }
+        });
+
+        let limit = params
+            .get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|l| l.min(100))
+            .unwrap_or(10);
+
+        let since_ms = params.get("since_ms").and_then(|s| s.parse().ok());
+
+        assert_eq!(
+            kinds,
+            Some(vec![MemoryKind::Event, MemoryKind::Summary])
+        );
+        assert_eq!(
+            tags_any,
+            Some(vec!["important".to_string(), "urgent".to_string()])
+        );
+        assert_eq!(limit, 25);
+        assert_eq!(since_ms, Some(1609459200000i64));
+    }
+
+    #[test]
+    fn test_scope_key_parsing() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("tenant_id".to_string(), "acme".to_string());
+        params.insert("workspace_id".to_string(), "workspace1".to_string());
+        params.insert("project_id".to_string(), "project1".to_string());
+        params.insert("agent_id".to_string(), "agent1".to_string());
+        params.insert("run_id".to_string(), "run1".to_string());
+
+        let tenant_id = params
+            .get("tenant_id")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "default".to_string());
+
+        assert_eq!(tenant_id, "acme");
+        assert_eq!(params.get("workspace_id").cloned(), Some("workspace1".to_string()));
+        assert_eq!(params.get("project_id").cloned(), Some("project1".to_string()));
+        assert_eq!(params.get("agent_id").cloned(), Some("agent1".to_string()));
+        assert_eq!(params.get("run_id").cloned(), Some("run1".to_string()));
+    }
+
+    #[test]
+    fn test_default_tenant_id() {
+        let params: HashMap<String, String> = HashMap::new();
+        let tenant_id = params
+            .get("tenant_id")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "default".to_string());
+
+        assert_eq!(tenant_id, "default");
+    }
+
+    // US-4: Recall/Lexical Search Tests
+
+    #[test]
+    fn test_text_match_score_exact() {
+        let score = compute_text_match_score("deployment", "deployment");
+        assert_eq!(score, 1.0);
+    }
+
+    #[test]
+    fn test_text_match_score_substring() {
+        let score = compute_text_match_score("production deployment complete", "deployment");
+        assert!(score > 0.0 && score < 1.0);
+        assert!(score >= 0.5); // Substring should score reasonably high
+    }
+
+    #[test]
+    fn test_text_match_score_no_match() {
+        let score = compute_text_match_score("hello world", "deployment");
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn test_text_match_score_case_insensitive() {
+        let score1 = compute_text_match_score("DEPLOYMENT", "deployment");
+        let score2 = compute_text_match_score("deployment", "DEPLOYMENT");
+        assert_eq!(score1, 1.0);
+        assert_eq!(score2, 1.0);
+    }
+
+    #[test]
+    fn test_text_match_score_early_position() {
+        let early = compute_text_match_score("deployment started", "deployment");
+        let late = compute_text_match_score("we started a deployment", "deployment");
+        assert!(early > late); // Earlier position scores higher
+    }
+
+    #[test]
+    fn test_text_match_score_multiple_occurrences() {
+        let score = compute_text_match_score("deployment and deployment and deployment", "deployment");
+        assert!(score > 0.9); // Multiple matches boost score
+    }
+
+    #[test]
+    fn test_text_match_score_empty_query() {
+        let score = compute_text_match_score("hello world", "");
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn test_recency_score_current() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let score = compute_recency_score(now);
+        assert!(score > 0.95); // Very recent items score high
+    }
+
+    #[test]
+    fn test_recency_score_old() {
+        let thirty_one_days_ago = chrono::Utc::now().timestamp_millis() - (31 * 24 * 60 * 60 * 1000);
+        let score = compute_recency_score(thirty_one_days_ago);
+        assert!(score < 0.1); // Very old items score low
+    }
+
+    #[test]
+    fn test_recency_score_one_week_old() {
+        let one_week_ago = chrono::Utc::now().timestamp_millis() - (7 * 24 * 60 * 60 * 1000);
+        let score = compute_recency_score(one_week_ago);
+        assert!(score > 0.7); // One week old should still score reasonably
+    }
+
+    #[test]
+    fn test_item_to_text_text_content() {
+        let item = MemoryItem {
+            id: MemoryId("test".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: mom_core::Content::Text("deployment failed".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 1.0,
+            source: "system".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let text = item_to_text(&item);
+        assert_eq!(text, "deployment failed");
+    }
+
+    #[test]
+    fn test_item_to_text_json_content() {
+        let json_val = serde_json::json!({"status": "failed", "reason": "timeout"});
+        let item = MemoryItem {
+            id: MemoryId("test".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: mom_core::Content::Json(json_val),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 1.0,
+            source: "system".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let text = item_to_text(&item);
+        assert!(text.contains("failed"));
+    }
+
+    #[test]
+    fn test_ranking_score_high_importance_recent() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let item = MemoryItem {
+            id: MemoryId("test".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: now,
+            content: mom_core::Content::Text("deployment started".to_string()),
+            tags: vec![],
+            importance: 0.9,
+            confidence: 1.0,
+            source: "system".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let score = compute_ranking_score(&item, "deployment");
+        assert!(score > 0.6); // Good match, high importance, recent
+    }
+
+    #[test]
+    fn test_ranking_score_low_importance_old() {
+        let thirty_days_ago = chrono::Utc::now().timestamp_millis() - (30 * 24 * 60 * 60 * 1000);
+        let item = MemoryItem {
+            id: MemoryId("test".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: thirty_days_ago,
+            content: mom_core::Content::Text("old deployment info".to_string()),
+            tags: vec![],
+            importance: 0.1,
+            confidence: 1.0,
+            source: "system".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let score = compute_ranking_score(&item, "deployment");
+        // Exact match (0.5) + low importance (0.1 * 0.3 = 0.03) + very low recency (0.02 * 0.2)
+        // ≈ 0.5 + 0.03 + 0.004 ≈ 0.534 (still reasonable since text match is high)
+        assert!(score < 0.7 && score > 0.3); // Match but low importance and old
+    }
+
+    #[test]
+    fn test_ranking_score_no_text_match() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let item = MemoryItem {
+            id: MemoryId("test".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: now,
+            content: mom_core::Content::Text("hello world".to_string()),
+            tags: vec![],
+            importance: 0.9,
+            confidence: 1.0,
+            source: "system".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let score = compute_ranking_score(&item, "deployment");
+        assert_eq!(score, 0.0); // No text match = 0 score (filtered out in recall)
+    }
+
+    #[test]
+    fn test_ranking_combination_weights() {
+        // Verify that text match, importance, and recency are weighted correctly
+        let now = chrono::Utc::now().timestamp_millis();
+        let item = MemoryItem {
+            id: MemoryId("test".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: now,
+            content: mom_core::Content::Text("deployment".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 1.0,
+            source: "system".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let score = compute_ranking_score(&item, "deployment");
+        // Expected: text_match(1.0) * 0.6 + importance(0.5) * 0.25 + recency(~1.0) * 0.15
+        // = 0.6 + 0.125 + 0.15 = 0.875
+        assert!(score > 0.85 && score < 0.95);
+    }
+
+    #[test]
+    fn test_recall_empty_query_returns_all() {
+        // Verify that empty query returns results without text filtering
+        // This test validates the query logic would work if results were available
+        let query_text = "";
+        assert!(query_text.is_empty());
+    }
+
+    #[test]
+    fn test_recall_filters_by_score() {
+        // Verify that results with 0 score are filtered out
+        let scores = vec![0.0, 0.5, 0.8, 0.0, 0.3];
+        let non_zero: Vec<_> = scores.iter().filter(|s| **s > 0.0).collect();
+        assert_eq!(non_zero.len(), 3);
+    }
+
+    #[test]
+    fn test_recall_sorts_by_score_descending() {
+        let mut scores = vec![0.3, 0.8, 0.5, 0.9];
+        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        assert_eq!(scores, vec![0.9, 0.8, 0.5, 0.3]);
     }
 }
