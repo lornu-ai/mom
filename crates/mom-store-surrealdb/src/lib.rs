@@ -3,20 +3,45 @@
 //! Leverages SurrealDB's document model, relationships, and queries
 //! for efficient memory storage and hybrid retrieval.
 
-use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, Query, Scored};
+use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, Query, Scored, ScopeKey, MemoryStore};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use surrealdb::engine::local::Db;
-use surrealdb::sql::Thing;
+use surrealdb::engine::local::{Db, Mem};
 use surrealdb::Surreal;
 use tracing::debug;
 
 pub mod hybrid;
 
+pub use hybrid::{HybridConfig, RankedResult};
+
 pub struct SurrealDBStore {
     db: Arc<Surreal<Db>>,
     namespace: String,
     database: String,
+}
+
+/// Compute cosine similarity between two vectors
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || b.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+
+    let mut dot_product = 0.0;
+    let mut norm_a = 0.0;
+    let mut norm_b = 0.0;
+
+    for i in 0..a.len() {
+        dot_product += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+
+    let magnitude = norm_a.sqrt() * norm_b.sqrt();
+    if magnitude == 0.0 {
+        0.0
+    } else {
+        dot_product / magnitude
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -52,7 +77,7 @@ struct StoredItem {
 impl SurrealDBStore {
     pub async fn new(_db_path: &str) -> anyhow::Result<Self> {
         // For in-memory backend, create new Surreal instance
-        let db = Surreal::new::<Db>(()).await?;
+        let db: Surreal<Db> = Surreal::new::<Mem>(()).await?;
         db.use_ns("mom").use_db("main").await?;
 
         Self::init_schema(&db).await?;
@@ -305,4 +330,182 @@ impl mom_core::MemoryStore for SurrealDBStore {
         debug!("Deleted memory item: {}", id.0);
         Ok(())
     }
+
+    /// Vector-based semantic search (Phase 2d)
+    async fn vector_recall(
+        &self,
+        query_embedding: &[f32],
+        scope: &ScopeKey,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
+        let results = semantic_recall(&self.db, scope, query_embedding, limit).await?;
+
+        let mut scored = Vec::with_capacity(results.len());
+        for (id, score) in results {
+            let memory_id = MemoryId(id);
+            if let Some(item) = self.get(&memory_id).await? {
+                scored.push(Scored { score, item });
+            }
+        }
+
+        Ok(scored)
+    }
+
+    /// Hybrid recall: lexical + semantic with RRF fusion (Phase 2d - Issue #12)
+    async fn hybrid_recall(
+        &self,
+        q: Query,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
+        let config = HybridConfig::default();
+        hybrid_recall_impl(self, &q.scope, &q.text, query_embedding, limit, &config)
+            .await
+    }
+}
+
+/// Helper: Lexical search using content text (Phase 2d)
+async fn lexical_recall(
+    db: &Surreal<Db>,
+    scope: &ScopeKey,
+    query_text: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<(String, f32)>> {
+    // Build SurrealQL query for full-text search
+    let mut query_str = format!(
+        "SELECT id, importance FROM memory_items WHERE tenant_id = '{}'",
+        &scope.tenant_id
+    );
+
+    // Apply scope refinements
+    if let Some(ref ws) = scope.workspace_id {
+        query_str.push_str(&format!(" AND workspace_id = '{}'", ws));
+    }
+    if let Some(ref proj) = scope.project_id {
+        query_str.push_str(&format!(" AND project_id = '{}'", proj));
+    }
+    if let Some(ref agent) = scope.agent_id {
+        query_str.push_str(&format!(" AND agent_id = '{}'", agent));
+    }
+
+    // Text match: search in content_text or tags
+    if !query_text.is_empty() {
+        query_str.push_str(&format!(
+            " AND (content_text CONTAINS '{}' OR tags CONTAINS ['{}'])",
+            query_text, query_text
+        ));
+    }
+
+    // Sort by importance, limit results
+    query_str.push_str(&format!(
+        " ORDER BY importance DESC, created_at_ms DESC LIMIT {}",
+        limit
+    ));
+
+    let results: Vec<StoredItem> = db.query(&query_str).await?.take(0)?;
+
+    let scored: Vec<(String, f32)> = results
+        .into_iter()
+        .map(|item| (item.id, item.importance))
+        .collect();
+
+    debug!("Lexical recall found {} results for query '{}'", scored.len(), query_text);
+    Ok(scored)
+}
+
+/// Helper: Semantic search using embeddings (Phase 2d)
+async fn semantic_recall(
+    db: &Surreal<Db>,
+    scope: &ScopeKey,
+    query_embedding: &[f32],
+    limit: usize,
+) -> anyhow::Result<Vec<(String, f32)>> {
+    // Vector similarity search - fetch all items with embeddings and compute cosine similarity
+    let mut query_str = format!(
+        "SELECT id, embedding FROM memory_items WHERE tenant_id = '{}' AND embedding IS NOT NULL",
+        &scope.tenant_id
+    );
+
+    // Apply scope refinements
+    if let Some(ref ws) = scope.workspace_id {
+        query_str.push_str(&format!(" AND workspace_id = '{}'", ws));
+    }
+    if let Some(ref proj) = scope.project_id {
+        query_str.push_str(&format!(" AND project_id = '{}'", proj));
+    }
+    if let Some(ref agent) = scope.agent_id {
+        query_str.push_str(&format!(" AND agent_id = '{}'", agent));
+    }
+
+    // Order by created_at_ms for stable ordering before similarity computation
+    query_str.push_str(&format!(" ORDER BY created_at_ms DESC LIMIT 1000"));
+
+    let results: Vec<StoredItem> = db.query(&query_str).await?.take(0)?;
+
+    // Compute cosine similarity for each item
+    let mut scored: Vec<(String, f32)> = results
+        .into_iter()
+        .filter_map(|item| {
+            item.embedding.as_ref().map(|embedding| {
+                let similarity = cosine_similarity(query_embedding, embedding);
+                (item.id, similarity)
+            })
+        })
+        .collect();
+
+    // Sort by similarity and truncate
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+
+    debug!("Semantic recall found {} results with embedding", scored.len());
+    Ok(scored)
+}
+
+/// Helper: Hybrid recall with RRF fusion (Phase 2d - Issue #12)
+async fn hybrid_recall_impl(
+    store: &SurrealDBStore,
+    scope: &ScopeKey,
+    query_text: &str,
+    query_embedding: &[f32],
+    limit: usize,
+    config: &hybrid::HybridConfig,
+) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
+    // Run lexical and semantic searches in parallel
+    let (lexical_results, semantic_results) = tokio::join!(
+        lexical_recall(&store.db, scope, query_text, limit),
+        semantic_recall(&store.db, scope, query_embedding, limit),
+    );
+
+    let lexical = lexical_results?;
+    let semantic = semantic_results?;
+
+    // Merge using RRF
+    let merged_ids = hybrid::merge_results_with_rrf(
+        lexical.clone(),
+        semantic.clone(),
+        config,
+        limit,
+    );
+
+    // Fetch full items and rebuild Scored results
+    let mut scored = Vec::with_capacity(merged_ids.len());
+    for (id, rrf_score) in merged_ids.iter() {
+        let memory_id = MemoryId(id.clone());
+        if let Some(item) = store.get(&memory_id).await? {
+            // Re-score: use RRF score from fusion
+            scored.push(Scored {
+                score: *rrf_score,
+                item,
+            });
+        }
+    }
+
+    debug!(
+        "Hybrid recall found {} results (lexical={}, semantic={}, merged={})",
+        scored.len(),
+        lexical.len(),
+        semantic.len(),
+        merged_ids.len()
+    );
+    Ok(scored)
 }
