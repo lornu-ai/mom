@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mom_core::{MemoryId, MemoryItem, MemoryKind, Query, Scored, ScopeKey, Content, MemoryStore};
+use mom_core::{MemoryId, MemoryItem, Query, Scored, ScopeKey, MemoryStore};
 use mom_store_surrealdb::SurrealDBStore;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
