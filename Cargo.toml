@@ -1,51 +1,15 @@
-[package]
-name = "mom"
+[workspace]
+members = [
+  "crates/mom-core",
+  "crates/mom-store-surrealdb",
+  "crates/mom-service",
+  "crates/mom-cli",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 authors = ["lornu-ai"]
-description = "Memory for autonomous agents of all types"
 license = "Apache-2.0"
 repository = "https://github.com/lornu-ai/mom"
-
-[workspace]
-members = [
-  ".",
-]
-
-[lib]
-name = "mom"
-path = "src/lib.rs"
-
-[[bin]]
-name = "mom"
-path = "src/bin/main.rs"
-
-[dependencies]
-tokio = { version = "1.35", features = ["full"] }
-axum = "0.7"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-uuid = { version = "1.6", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-thiserror = "1.0"
-anyhow = "1.0"
-async-trait = "0.1"
-
-# Storage
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "postgres", "json"] }
-rusqlite = { version = "0.30", optional = true }
-
-# Utilities
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
-
-[features]
-default = ["sqlite"]
-sqlite = []
-postgres = []
-
-[dev-dependencies]
-tokio-test = "0.4"
-tempfile = "3.8"

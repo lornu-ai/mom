@@ -1,0 +1,27 @@
+{
+  "name": "@lornu/mom",
+  "version": "0.1.0",
+  "description": "TypeScript/Bun client for MOM - Memory for Autonomous Agents",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "bun test",
+    "dev": "bun run src/index.ts"
+  },
+  "keywords": [
+    "memory",
+    "agents",
+    "ai",
+    "event-sourced"
+  ],
+  "author": "lornu-ai",
+  "license": "Apache-2.0"
+}

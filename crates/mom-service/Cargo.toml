@@ -1,0 +1,32 @@
+[package]
+name = "mom-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP API service for MOM using Axum"
+
+[[bin]]
+name = "mom"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1.0", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+anyhow = "1.0"
+thiserror = "1.0"
+
+mom-core = { path = "../mom-core" }
+mom-store-surrealdb = { path = "../mom-store-surrealdb" }
+
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
