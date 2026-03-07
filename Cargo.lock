@@ -2078,7 +2078,10 @@ dependencies = [
  "chrono",
  "mom-core",
  "mom-embeddings",
+<<<<<<< HEAD
  "mom-sources",
+=======
+>>>>>>> 9e9719f (feat(mom-service): implement Phase 2a Vector Embeddings Integration)
  "mom-store-surrealdb",
  "serde",
  "serde_json",
