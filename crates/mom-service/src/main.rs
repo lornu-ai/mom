@@ -99,10 +99,55 @@ async fn list_memories(
     State(st): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Vec<MemoryItem>>, ApiError> {
+    use mom_core::MemoryKind;
+
+    // Parse scope parameters (required: tenant_id)
     let tenant_id = params
         .get("tenant_id")
         .map(|s| s.to_string())
         .unwrap_or_else(|| "default".to_string());
+
+    // Parse kinds filter (comma-separated, case-insensitive)
+    let kinds = params.get("kinds").and_then(|s| {
+        let kinds: Vec<_> = s
+            .split(',')
+            .filter_map(|k| {
+                match k.trim().to_lowercase().as_str() {
+                    "event" => Some(MemoryKind::Event),
+                    "summary" => Some(MemoryKind::Summary),
+                    "fact" => Some(MemoryKind::Fact),
+                    "preference" => Some(MemoryKind::Preference),
+                    _ => None,
+                }
+            })
+            .collect();
+        if kinds.is_empty() { None } else { Some(kinds) }
+    });
+
+    // Parse tags filter (comma-separated)
+    let tags_any = params.get("tags").and_then(|s| {
+        let tags: Vec<_> = s
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        if tags.is_empty() { None } else { Some(tags) }
+    });
+
+    // Parse time range (milliseconds since epoch)
+    let since_ms = params
+        .get("since_ms")
+        .and_then(|s| s.parse::<i64>().ok());
+    let until_ms = params
+        .get("until_ms")
+        .and_then(|s| s.parse::<i64>().ok());
+
+    // Parse limit (default 10, max 100)
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|l| l.min(100)) // Clamp to max 100
+        .unwrap_or(10);
 
     let query = Query {
         scope: ScopeKey {
@@ -113,14 +158,11 @@ async fn list_memories(
             run_id: params.get("run_id").cloned(),
         },
         text: String::new(),
-        kinds: None,
-        tags_any: None,
-        limit: params
-            .get("limit")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10),
-        since_ms: None,
-        until_ms: None,
+        kinds,
+        tags_any,
+        limit,
+        since_ms,
+        until_ms,
     };
 
     let results = st.store.query(query).await?;
@@ -166,7 +208,11 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
-            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::Internal(_msg) => {
+                // Log the real error server-side (via tracing), but return generic message to client
+                // to avoid exposing sensitive information (database errors, stack traces, etc.)
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
+            },
         };
 
         let body = Json(serde_json::json!({
