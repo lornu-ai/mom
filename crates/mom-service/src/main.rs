@@ -5,7 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mom_core::{MemoryId, MemoryItem, MemoryKind, Query, Scored, ScopeKey, Content};
+use mom_core::{MemoryId, MemoryItem, MemoryKind, Query, Scored, ScopeKey, MemoryStore};
 use mom_store_surrealdb::SurrealDBStore;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
@@ -104,6 +104,42 @@ async fn list_memories(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "default".to_string());
 
+    // Parse kinds filter (comma-separated: event,summary,fact,preference)
+    let kinds = params.get("kinds").and_then(|k| {
+        let parsed: Result<Vec<MemoryKind>, _> = k
+            .split(',')
+            .map(|s| match s.trim().to_lowercase().as_str() {
+                "event" => Ok(MemoryKind::Event),
+                "summary" => Ok(MemoryKind::Summary),
+                "fact" => Ok(MemoryKind::Fact),
+                "preference" => Ok(MemoryKind::Preference),
+                _ => Err(()),
+            })
+            .collect();
+        parsed.ok().and_then(|v| if v.is_empty() { None } else { Some(v) })
+    });
+
+    // Parse tags filter (comma-separated)
+    let tags_any = params.get("tags").and_then(|t| {
+        let tags: Vec<String> = t.split(',').map(|s| s.trim().to_string()).collect();
+        if tags.is_empty() || tags.iter().all(|s| s.is_empty()) {
+            None
+        } else {
+            Some(tags.into_iter().filter(|s| !s.is_empty()).collect())
+        }
+    });
+
+    // Parse time range filters (milliseconds since epoch)
+    let since_ms = params.get("since_ms").and_then(|s| s.parse().ok());
+    let until_ms = params.get("until_ms").and_then(|s| s.parse().ok());
+
+    // Parse and clamp limit to max 100
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|l| l.min(100))
+        .unwrap_or(10);
+
     let query = Query {
         scope: ScopeKey {
             tenant_id,
@@ -113,14 +149,11 @@ async fn list_memories(
             run_id: params.get("run_id").cloned(),
         },
         text: String::new(),
-        kinds: None,
-        tags_any: None,
-        limit: params
-            .get("limit")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(10),
-        since_ms: None,
-        until_ms: None,
+        kinds,
+        tags_any,
+        limit,
+        since_ms,
+        until_ms,
     };
 
     let results = st.store.query(query).await?;
@@ -174,5 +207,311 @@ impl IntoResponse for ApiError {
         }));
 
         (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // Helper to parse kinds filter (extracted from list_memories logic for testability)
+    fn parse_kinds(kinds_str: &str) -> Option<Vec<MemoryKind>> {
+        let parsed: Result<Vec<MemoryKind>, _> = kinds_str
+            .split(',')
+            .map(|s| match s.trim().to_lowercase().as_str() {
+                "event" => Ok(MemoryKind::Event),
+                "summary" => Ok(MemoryKind::Summary),
+                "fact" => Ok(MemoryKind::Fact),
+                "preference" => Ok(MemoryKind::Preference),
+                _ => Err(()),
+            })
+            .collect();
+        parsed
+            .ok()
+            .and_then(|v: Vec<MemoryKind>| if v.is_empty() { None } else { Some(v) })
+    }
+
+    // Helper to parse tags filter
+    fn parse_tags(tags_str: &str) -> Option<Vec<String>> {
+        let tags: Vec<String> = tags_str.split(',').map(|s| s.trim().to_string()).collect();
+        if tags.is_empty() || tags.iter().all(|s| s.is_empty()) {
+            None
+        } else {
+            Some(tags.into_iter().filter(|s: &String| !s.is_empty()).collect())
+        }
+    }
+
+    #[test]
+    fn test_parse_single_kind() {
+        let kinds = parse_kinds("event");
+        assert_eq!(kinds, Some(vec![MemoryKind::Event]));
+    }
+
+    #[test]
+    fn test_parse_multiple_kinds() {
+        let kinds = parse_kinds("event,summary,fact");
+        assert_eq!(
+            kinds,
+            Some(vec![
+                MemoryKind::Event,
+                MemoryKind::Summary,
+                MemoryKind::Fact
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_kinds_with_whitespace() {
+        let kinds = parse_kinds("event , summary , fact");
+        assert_eq!(
+            kinds,
+            Some(vec![
+                MemoryKind::Event,
+                MemoryKind::Summary,
+                MemoryKind::Fact
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_kinds_case_insensitive() {
+        let kinds = parse_kinds("EVENT,Summary,FACT");
+        assert_eq!(
+            kinds,
+            Some(vec![
+                MemoryKind::Event,
+                MemoryKind::Summary,
+                MemoryKind::Fact
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_invalid_kind() {
+        let kinds = parse_kinds("invalid,event");
+        assert_eq!(kinds, None);
+    }
+
+    #[test]
+    fn test_parse_empty_kinds() {
+        let kinds = parse_kinds("");
+        assert_eq!(kinds, None);
+    }
+
+    #[test]
+    fn test_parse_all_kinds() {
+        let kinds = parse_kinds("event,summary,fact,preference");
+        assert_eq!(
+            kinds,
+            Some(vec![
+                MemoryKind::Event,
+                MemoryKind::Summary,
+                MemoryKind::Fact,
+                MemoryKind::Preference
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_single_tag() {
+        let tags = parse_tags("important");
+        assert_eq!(tags, Some(vec!["important".to_string()]));
+    }
+
+    #[test]
+    fn test_parse_multiple_tags() {
+        let tags = parse_tags("important,urgent,review");
+        assert_eq!(
+            tags,
+            Some(vec![
+                "important".to_string(),
+                "urgent".to_string(),
+                "review".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_tags_with_whitespace() {
+        let tags = parse_tags("important , urgent , review");
+        assert_eq!(
+            tags,
+            Some(vec![
+                "important".to_string(),
+                "urgent".to_string(),
+                "review".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_tags() {
+        let tags = parse_tags("");
+        assert_eq!(tags, None);
+    }
+
+    #[test]
+    fn test_parse_empty_tags_with_commas() {
+        let tags = parse_tags(",,");
+        assert_eq!(tags, None);
+    }
+
+    #[test]
+    fn test_parse_tags_with_empty_elements() {
+        let tags = parse_tags("important,,urgent");
+        assert_eq!(tags, Some(vec!["important".to_string(), "urgent".to_string()]));
+    }
+
+    #[test]
+    fn test_limit_default() {
+        let params: HashMap<String, String> = HashMap::new();
+        let limit = params
+            .get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|l| l.min(100))
+            .unwrap_or(10);
+        assert_eq!(limit, 10);
+    }
+
+    #[test]
+    fn test_limit_custom() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("limit".to_string(), "50".to_string());
+        let limit = params
+            .get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|l| l.min(100))
+            .unwrap_or(10);
+        assert_eq!(limit, 50);
+    }
+
+    #[test]
+    fn test_limit_clamped() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("limit".to_string(), "500".to_string());
+        let limit = params
+            .get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|l| l.min(100))
+            .unwrap_or(10);
+        assert_eq!(limit, 100);
+    }
+
+    #[test]
+    fn test_limit_invalid() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("limit".to_string(), "invalid".to_string());
+        let limit = params
+            .get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|l| l.min(100))
+            .unwrap_or(10);
+        assert_eq!(limit, 10);
+    }
+
+    #[test]
+    fn test_timestamp_parsing() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("since_ms".to_string(), "1609459200000".to_string());
+        params.insert("until_ms".to_string(), "1609545600000".to_string());
+
+        let since_ms = params.get("since_ms").and_then(|s| s.parse().ok());
+        let until_ms = params.get("until_ms").and_then(|s| s.parse().ok());
+
+        assert_eq!(since_ms, Some(1609459200000i64));
+        assert_eq!(until_ms, Some(1609545600000i64));
+    }
+
+    #[test]
+    fn test_timestamp_invalid() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("since_ms".to_string(), "invalid".to_string());
+
+        let since_ms = params.get("since_ms").and_then(|s| s.parse::<i64>().ok());
+        assert_eq!(since_ms, None);
+    }
+
+    #[test]
+    fn test_combined_filters() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("kinds".to_string(), "event,summary".to_string());
+        params.insert("tags".to_string(), "important,urgent".to_string());
+        params.insert("limit".to_string(), "25".to_string());
+        params.insert("since_ms".to_string(), "1609459200000".to_string());
+
+        let kinds = params.get("kinds").and_then(|k| {
+            let parsed: Result<Vec<MemoryKind>, _> = k
+                .split(',')
+                .map(|s| match s.trim().to_lowercase().as_str() {
+                    "event" => Ok(MemoryKind::Event),
+                    "summary" => Ok(MemoryKind::Summary),
+                    "fact" => Ok(MemoryKind::Fact),
+                    "preference" => Ok(MemoryKind::Preference),
+                    _ => Err(()),
+                })
+                .collect();
+            parsed.ok().and_then(|v: Vec<MemoryKind>| if v.is_empty() { None } else { Some(v) })
+        });
+
+        let tags_any = params.get("tags").and_then(|t| {
+            let tags: Vec<String> = t.split(',').map(|s| s.trim().to_string()).collect();
+            if tags.is_empty() || tags.iter().all(|s| s.is_empty()) {
+                None
+            } else {
+                Some(tags.into_iter().filter(|s: &String| !s.is_empty()).collect())
+            }
+        });
+
+        let limit = params
+            .get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|l| l.min(100))
+            .unwrap_or(10);
+
+        let since_ms = params.get("since_ms").and_then(|s| s.parse().ok());
+
+        assert_eq!(
+            kinds,
+            Some(vec![MemoryKind::Event, MemoryKind::Summary])
+        );
+        assert_eq!(
+            tags_any,
+            Some(vec!["important".to_string(), "urgent".to_string()])
+        );
+        assert_eq!(limit, 25);
+        assert_eq!(since_ms, Some(1609459200000i64));
+    }
+
+    #[test]
+    fn test_scope_key_parsing() {
+        let mut params: HashMap<String, String> = HashMap::new();
+        params.insert("tenant_id".to_string(), "acme".to_string());
+        params.insert("workspace_id".to_string(), "workspace1".to_string());
+        params.insert("project_id".to_string(), "project1".to_string());
+        params.insert("agent_id".to_string(), "agent1".to_string());
+        params.insert("run_id".to_string(), "run1".to_string());
+
+        let tenant_id = params
+            .get("tenant_id")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "default".to_string());
+
+        assert_eq!(tenant_id, "acme");
+        assert_eq!(params.get("workspace_id").cloned(), Some("workspace1".to_string()));
+        assert_eq!(params.get("project_id").cloned(), Some("project1".to_string()));
+        assert_eq!(params.get("agent_id").cloned(), Some("agent1".to_string()));
+        assert_eq!(params.get("run_id").cloned(), Some("run1".to_string()));
+    }
+
+    #[test]
+    fn test_default_tenant_id() {
+        let params: HashMap<String, String> = HashMap::new();
+        let tenant_id = params
+            .get("tenant_id")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "default".to_string());
+
+        assert_eq!(tenant_id, "default");
     }
 }
