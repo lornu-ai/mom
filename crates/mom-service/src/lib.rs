@@ -6,7 +6,7 @@
 use axum::response::IntoResponse;
 use axum::http::StatusCode;
 use axum::Json;
-use mom_core::{MemoryId, MemoryItem, ScopeKey};
+use mom_core::{MemoryId, MemoryItem, MemoryKind, Query, Scored, ScopeKey, Content};
 use serde_json::json;
 use tracing::error;
 
@@ -42,7 +42,6 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mom_core::{MemoryId, MemoryItem, MemoryKind, ScopeKey, Content};
 
     #[test]
     fn test_memory_item_text_event() {
