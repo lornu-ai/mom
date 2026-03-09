@@ -199,7 +199,11 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
-            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::Internal(_msg) => {
+                // Log the real error server-side (via tracing), but return generic message to client
+                // to avoid exposing sensitive information (database errors, stack traces, etc.)
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
+            },
         };
 
         let body = Json(serde_json::json!({
