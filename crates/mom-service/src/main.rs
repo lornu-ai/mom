@@ -168,11 +168,32 @@ async fn delete_memory(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ============================================================================
+// Recall Ranking Constants
+// ============================================================================
+
+/// Time window for recency decay (30 days in milliseconds)
+const RECENCY_DECAY_WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Scoring weights for combined ranking
+const TEXT_MATCH_WEIGHT: f32 = 0.60;
+const IMPORTANCE_WEIGHT: f32 = 0.25;
+const RECENCY_WEIGHT: f32 = 0.15;
+
+/// Multiply limit by this factor when fetching candidates for ranking
+/// Ensures high-relevance items aren't filtered by initial LIMIT clause
+const CANDIDATE_MULTIPLIER: usize = 5;
+
+// ============================================================================
+// Recall Ranking Functions
+// ============================================================================
+
 /// Compute lexical search score (0..1) based on text match
 /// Returns 0.0 if query doesn't match, up to 1.0 for exact match
 fn compute_text_match_score(item_content: &str, query_text: &str) -> f32 {
-    if query_text.is_empty() {
-        return 0.0; // No scoring for empty query
+    // Handle empty inputs to prevent division by zero
+    if query_text.is_empty() || item_content.is_empty() {
+        return 0.0;
     }
 
     let query_lower = query_text.to_lowercase();
@@ -183,31 +204,31 @@ fn compute_text_match_score(item_content: &str, query_text: &str) -> f32 {
         return 1.0;
     }
 
-    // Substring match: score based on how many times query appears
+    // Substring match: check if query appears
     let match_count = content_lower.matches(&query_lower).count();
     if match_count == 0 {
         return 0.0;
     }
 
-    // Score: 0.3 + (0.7 * (1 / distance_to_start)) for first match position
+    // Position-based scoring: early matches score higher
     let position = content_lower.find(&query_lower).unwrap_or(content_lower.len());
     let distance_ratio = (position as f32) / (content_lower.len() as f32);
-    let position_score = 1.0 - (distance_ratio * 0.5); // Early matches score higher
+    let position_score = 1.0 - (distance_ratio * 0.5); // Early matches boost score
 
-    // Combine: base score for substring + position boost
-    let score = (match_count as f32).min(1.0) * 0.5 + position_score * 0.5;
+    // Combined score: 50% for substring match + 50% for position
+    // Multiple matches don't increase score further (already checked for existence)
+    let score = 0.5 + position_score * 0.5;
     score.min(1.0)
 }
 
 /// Compute recency score (0..1) based on how recent the memory is
-/// Newer items score higher
+/// Newer items score higher, older items decay to 0 after RECENCY_DECAY_WINDOW_MS
 fn compute_recency_score(created_at_ms: i64) -> f32 {
     let now = chrono::Utc::now().timestamp_millis();
     let age_ms = (now - created_at_ms).max(0);
 
-    // Decay function: memories decay over 30 days (2,592,000,000 ms)
-    let max_age_ms = 30 * 24 * 60 * 60 * 1000i64;
-    let decay = (age_ms as f32) / (max_age_ms as f32);
+    // Decay function: memories score 1.0 if current, decay to 0.0 after window
+    let decay = (age_ms as f32) / (RECENCY_DECAY_WINDOW_MS as f32);
     (1.0 - decay).max(0.0)
 }
 
@@ -226,8 +247,8 @@ fn compute_ranking_score(
     let recency = compute_recency_score(item.created_at_ms);
     let importance = item.importance;
 
-    // Weighted combination: 60% text match, 25% importance, 15% recency
-    (text_match * 0.6) + (importance * 0.25) + (recency * 0.15)
+    // Weighted combination of ranking factors
+    (text_match * TEXT_MATCH_WEIGHT) + (importance * IMPORTANCE_WEIGHT) + (recency * RECENCY_WEIGHT)
 }
 
 /// Extract text content from MemoryItem for searching
@@ -250,11 +271,16 @@ async fn recall(
         q.scope.tenant_id = "default".to_string();
     }
 
-    // Get base results from store (applies scope and kind filters)
-    let results = st.store.query(q.clone()).await?;
-
     // Apply lexical search scoring if query text is provided
     if !q.text.is_empty() {
+        // Fetch larger candidate set for ranking (don't lose high-relevance items to LIMIT)
+        // Multiply limit by CANDIDATE_MULTIPLIER to ensure ranking sees diverse results
+        let original_limit = q.limit;
+        q.limit = (q.limit * CANDIDATE_MULTIPLIER).min(1000); // Cap at 1000 for safety
+
+        let results = st.store.query(q.clone()).await?;
+
+        // Apply ranking: compute scores and filter by text match
         let mut scored: Vec<Scored<MemoryItem>> = results
             .into_iter()
             .map(|scored_item| {
@@ -264,18 +290,19 @@ async fn recall(
                     item: scored_item.item,
                 }
             })
-            .filter(|s| s.score > 0.0) // Only keep items with non-zero score
+            .filter(|s| s.score > 0.0) // Only keep items with text match
             .collect();
 
         // Sort by score descending
         scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Apply limit
-        scored.truncate(q.limit);
+        // Apply original limit to final results
+        scored.truncate(original_limit);
 
         Ok(Json(scored))
     } else {
-        // No query text: return results as-is (sorted by store default)
+        // No query text: return results as-is (store determines ordering)
+        let results = st.store.query(q).await?;
         Ok(Json(results))
     }
 }
@@ -870,17 +897,115 @@ mod tests {
     }
 
     #[test]
-    fn test_recall_filters_by_score() {
-        // Verify that results with 0 score are filtered out
-        let scores = vec![0.0, 0.5, 0.8, 0.0, 0.3];
-        let non_zero: Vec<_> = scores.iter().filter(|s| **s > 0.0).collect();
-        assert_eq!(non_zero.len(), 3);
+    fn test_ranking_high_importance_beats_recency() {
+        // Verify that importance significantly affects ranking
+        let now = chrono::Utc::now().timestamp_millis();
+        let recent_low_importance = MemoryItem {
+            id: MemoryId("recent".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: now,
+            content: mom_core::Content::Text("deployment".to_string()),
+            tags: vec![],
+            importance: 0.2, // Low importance
+            confidence: 1.0,
+            source: "test".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let old_high_importance = MemoryItem {
+            id: MemoryId("old".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: now - (20 * 24 * 60 * 60 * 1000), // 20 days old
+            content: mom_core::Content::Text("deployment".to_string()),
+            tags: vec![],
+            importance: 0.9, // High importance
+            confidence: 1.0,
+            source: "test".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let recent_score = compute_ranking_score(&recent_low_importance, "deployment");
+        let old_score = compute_ranking_score(&old_high_importance, "deployment");
+
+        // High importance should outweigh recency: 0.6 + 0.9*0.25 + ~0.6*0.15
+        // = 0.6 + 0.225 + 0.09 ≈ 0.915
+        // vs 0.6 + 0.2*0.25 + 1.0*0.15 = 0.6 + 0.05 + 0.15 = 0.8
+        assert!(old_score > recent_score);
     }
 
     #[test]
-    fn test_recall_sorts_by_score_descending() {
-        let mut scores = vec![0.3, 0.8, 0.5, 0.9];
-        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        assert_eq!(scores, vec![0.9, 0.8, 0.5, 0.3]);
+    fn test_ranking_text_match_primary_factor() {
+        // Verify that text match is the dominant scoring factor
+        let now = chrono::Utc::now().timestamp_millis();
+        let high_importance = MemoryItem {
+            id: MemoryId("high".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: now - (25 * 24 * 60 * 60 * 1000),
+            content: mom_core::Content::Text("deployment".to_string()),
+            tags: vec![],
+            importance: 0.9,
+            confidence: 1.0,
+            source: "test".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let no_match = MemoryItem {
+            id: MemoryId("nomatch".to_string()),
+            scope: ScopeKey {
+                tenant_id: "test".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Event,
+            created_at_ms: now,
+            content: mom_core::Content::Text("hello world".to_string()),
+            tags: vec![],
+            importance: 0.9,
+            confidence: 1.0,
+            source: "test".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let match_score = compute_ranking_score(&high_importance, "deployment");
+        let no_match_score = compute_ranking_score(&no_match, "deployment");
+
+        // No text match = 0, regardless of importance/recency
+        assert_eq!(no_match_score, 0.0);
+        assert!(match_score > 0.0);
     }
 }
