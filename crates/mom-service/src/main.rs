@@ -1012,4 +1012,5 @@ mod tests {
         assert_eq!(no_match_score, 0.0);
         assert!(match_score > 0.0);
     }
+
 }
