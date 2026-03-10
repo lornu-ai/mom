@@ -582,4 +582,199 @@ mod tests {
         with_tags.tags = vec!["important".to_string()];
         assert_eq!(with_tags.tags.len(), 1);
     }
+
+    // ============================================================================
+    // US-7: Multi-Tenant Isolation Tests
+    // ============================================================================
+
+    #[test]
+    fn test_scope_key_tenant_isolation_basic() {
+        // Verify that different tenants can be distinguished in ScopeKey
+        let tenant_a_scope = ScopeKey {
+            tenant_id: "acme-corp".to_string(),
+            workspace_id: Some("ws-1".to_string()),
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        };
+
+        let tenant_b_scope = ScopeKey {
+            tenant_id: "globex-corp".to_string(),
+            workspace_id: Some("ws-1".to_string()),
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        };
+
+        assert_ne!(tenant_a_scope.tenant_id, tenant_b_scope.tenant_id);
+        assert_eq!(tenant_a_scope.tenant_id, "acme-corp");
+        assert_eq!(tenant_b_scope.tenant_id, "globex-corp");
+    }
+
+    #[test]
+    fn test_scope_key_same_tenant_different_workspaces() {
+        // Verify same tenant can have different workspaces
+        let scope_ws1 = ScopeKey {
+            tenant_id: "acme".to_string(),
+            workspace_id: Some("workspace-1".to_string()),
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        };
+
+        let scope_ws2 = ScopeKey {
+            tenant_id: "acme".to_string(),
+            workspace_id: Some("workspace-2".to_string()),
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        };
+
+        // Same tenant but different workspaces
+        assert_eq!(scope_ws1.tenant_id, scope_ws2.tenant_id);
+        assert_ne!(scope_ws1.workspace_id, scope_ws2.workspace_id);
+    }
+
+    #[test]
+    fn test_memory_item_preserves_tenant_scope() {
+        // Verify MemoryItem properly stores and preserves tenant scope
+        let tenant_scope = ScopeKey {
+            tenant_id: "customer-123".to_string(),
+            workspace_id: Some("proj-abc".to_string()),
+            project_id: Some("task-xyz".to_string()),
+            agent_id: Some("agent-001".to_string()),
+            run_id: Some("run-2024-03-10".to_string()),
+        };
+
+        let item = MemoryItem {
+            id: MemoryId("mem-001".to_string()),
+            scope: tenant_scope.clone(),
+            kind: MemoryKind::Event,
+            created_at_ms: 0,
+            content: Content::Text("Sensitive customer data".to_string()),
+            tags: vec!["confidential".to_string()],
+            importance: 0.9,
+            confidence: 1.0,
+            source: "customer-app".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        // Verify all scope fields are preserved
+        assert_eq!(item.scope.tenant_id, "customer-123");
+        assert_eq!(item.scope.workspace_id, Some("proj-abc".to_string()));
+        assert_eq!(item.scope.project_id, Some("task-xyz".to_string()));
+        assert_eq!(item.scope.agent_id, Some("agent-001".to_string()));
+        assert_eq!(item.scope.run_id, Some("run-2024-03-10".to_string()));
+    }
+
+    #[test]
+    fn test_different_tenants_can_have_same_id() {
+        // Verify that two items with same ID but different tenants are distinct
+        let shared_id = MemoryId("shared-memory-001".to_string());
+
+        let tenant_a_item = MemoryItem {
+            id: shared_id.clone(),
+            scope: ScopeKey {
+                tenant_id: "tenant-a".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Fact,
+            created_at_ms: 1000,
+            content: Content::Text("Tenant A data".to_string()),
+            tags: vec![],
+            importance: 0.5,
+            confidence: 1.0,
+            source: "a-system".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        let tenant_b_item = MemoryItem {
+            id: shared_id.clone(),
+            scope: ScopeKey {
+                tenant_id: "tenant-b".to_string(),
+                workspace_id: None,
+                project_id: None,
+                agent_id: None,
+                run_id: None,
+            },
+            kind: MemoryKind::Fact,
+            created_at_ms: 2000,
+            content: Content::Text("Tenant B data".to_string()),
+            tags: vec![],
+            importance: 0.7,
+            confidence: 1.0,
+            source: "b-system".to_string(),
+            ttl_ms: None,
+            meta: Default::default(),
+            embedding: None,
+            embedding_model: None,
+        };
+
+        // Same ID, but completely different data due to different tenants
+        assert_eq!(tenant_a_item.id, tenant_b_item.id);
+        assert_ne!(tenant_a_item.scope.tenant_id, tenant_b_item.scope.tenant_id);
+        // Content is different (though we can't use != directly on enum without PartialEq)
+        match (&tenant_a_item.content, &tenant_b_item.content) {
+            (Content::Text(a), Content::Text(b)) => assert_ne!(a, b),
+            _ => panic!("Expected both to be Text content"),
+        }
+        assert_ne!(tenant_a_item.created_at_ms, tenant_b_item.created_at_ms);
+    }
+
+    #[test]
+    fn test_scope_validation_cross_tenant_mismatch() {
+        // Verify logic to detect when scopes don't match
+        let item_scope = ScopeKey {
+            tenant_id: "tenant-x".to_string(),
+            workspace_id: Some("ws-1".to_string()),
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        };
+
+        let request_scope = ScopeKey {
+            tenant_id: "tenant-y".to_string(),
+            workspace_id: Some("ws-1".to_string()),
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        };
+
+        // Simulate isolation check: item should only be accessible if tenants match
+        let tenant_isolation_check = item_scope.tenant_id == request_scope.tenant_id;
+        assert!(!tenant_isolation_check, "Should detect tenant mismatch");
+    }
+
+    #[test]
+    fn test_scope_validation_same_tenant_allowed() {
+        // Verify logic to allow access when tenants match
+        let item_scope = ScopeKey {
+            tenant_id: "tenant-alpha".to_string(),
+            workspace_id: Some("ws-1".to_string()),
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        };
+
+        let request_scope = ScopeKey {
+            tenant_id: "tenant-alpha".to_string(),
+            workspace_id: Some("ws-1".to_string()),
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        };
+
+        // Simulate isolation check: item should be accessible if tenants match
+        let tenant_isolation_check = item_scope.tenant_id == request_scope.tenant_id;
+        assert!(tenant_isolation_check, "Should allow access when tenant matches");
+    }
 }

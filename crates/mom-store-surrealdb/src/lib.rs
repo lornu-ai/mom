@@ -226,6 +226,48 @@ impl mom_core::MemoryStore for SurrealDBStore {
         }))
     }
 
+    async fn get_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<Option<MemoryItem>> {
+        // SECURITY: Query with tenant_id filter to enforce multi-tenant isolation at DB level
+        let query = format!(
+            "SELECT * FROM memory_items WHERE id = '{}' AND tenant_id = '{}'",
+            id.0, scope.tenant_id
+        );
+        let results: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+
+        Ok(results.into_iter().next().map(|s| {
+            let content = match (s.content_text, s.content_json) {
+                (Some(text), None) => Content::Text(text),
+                (None, Some(json)) => Content::Json(json),
+                (Some(text), Some(json)) => Content::TextJson { text, json },
+                _ => Content::Text(String::new()),
+            };
+
+            let kind = Self::str_to_kind(&s.kind).unwrap_or(MemoryKind::Event);
+
+            MemoryItem {
+                id: MemoryId(s.id),
+                scope: mom_core::ScopeKey {
+                    tenant_id: s.tenant_id,
+                    workspace_id: s.workspace_id,
+                    project_id: s.project_id,
+                    agent_id: s.agent_id,
+                    run_id: s.run_id,
+                },
+                kind,
+                created_at_ms: s.created_at_ms,
+                content,
+                tags: s.tags,
+                importance: s.importance,
+                confidence: s.confidence,
+                source: s.source,
+                ttl_ms: s.ttl_ms,
+                meta: serde_json::from_value(s.meta).unwrap_or_default(),
+                embedding: s.embedding,
+                embedding_model: s.embedding_model,
+            }
+        }))
+    }
+
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
         // Build SurrealQL query with tenant filter + optional refinements
         let mut query_str = format!(
@@ -328,6 +370,18 @@ impl mom_core::MemoryStore for SurrealDBStore {
         let query = format!("DELETE memory_items:{}", id.0);
         let _: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
         debug!("Deleted memory item: {}", id.0);
+        Ok(())
+    }
+
+    async fn delete_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<()> {
+        // SECURITY: Delete with tenant_id filter to enforce multi-tenant isolation at DB level
+        // This ensures we can only delete items that belong to the calling tenant
+        let query = format!(
+            "DELETE memory_items WHERE id = '{}' AND tenant_id = '{}'",
+            id.0, scope.tenant_id
+        );
+        let _: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+        debug!("Deleted memory item scoped to tenant: {} (id: {})", scope.tenant_id, id.0);
         Ok(())
     }
 

@@ -87,6 +87,32 @@ pub trait MemoryStore: Send + Sync {
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>>;
     async fn delete(&self, id: &MemoryId) -> anyhow::Result<()>;
 
+    /// Tenant-aware get: retrieves an item only if it belongs to the specified scope
+    /// Returns None if item doesn't exist or doesn't belong to the tenant
+    /// SECURITY: This method enforces multi-tenant isolation
+    async fn get_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<Option<MemoryItem>> {
+        // Default implementation: get item and verify tenant match
+        if let Some(item) = self.get(id).await? {
+            if item.scope.tenant_id == scope.tenant_id {
+                return Ok(Some(item));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Tenant-aware delete: deletes an item only if it belongs to the specified scope
+    /// Returns Ok(()) whether item exists or not (idempotent)
+    /// SECURITY: This method enforces multi-tenant isolation
+    async fn delete_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<()> {
+        // Default implementation: get item and verify tenant match before delete
+        if let Some(item) = self.get(id).await? {
+            if item.scope.tenant_id == scope.tenant_id {
+                self.delete(id).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Vector-based semantic search (Phase 2)
     async fn vector_recall(
         &self,
