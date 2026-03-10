@@ -88,11 +88,11 @@ async fn get_memory(
     Path(id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<MemoryItem>, ApiError> {
-    // SECURITY: Extract tenant_id from query parameter (will be from auth context in US-17)
+    // SECURITY: Require tenant_id from query parameter (will be from auth context in US-17)
     let tenant_id = params
         .get("tenant_id")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "default".to_string());
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
 
     let scope = ScopeKey {
         tenant_id,
@@ -117,8 +117,8 @@ async fn list_memories(
 ) -> Result<Json<Vec<MemoryItem>>, ApiError> {
     let tenant_id = params
         .get("tenant_id")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "default".to_string());
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
 
     // Parse kinds filter (comma-separated: event,summary,fact,preference)
     let kinds = params.get("kinds").and_then(|k| {
@@ -181,11 +181,11 @@ async fn delete_memory(
     Path(id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode, ApiError> {
-    // SECURITY: Extract tenant_id from query parameter (will be from auth context in US-17)
+    // SECURITY: Require tenant_id from query parameter (will be from auth context in US-17)
     let tenant_id = params
         .get("tenant_id")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "default".to_string());
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
 
     let scope = ScopeKey {
         tenant_id,
