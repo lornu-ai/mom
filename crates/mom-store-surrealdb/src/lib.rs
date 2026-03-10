@@ -143,6 +143,12 @@ impl SurrealDBStore {
             _ => None,
         }
     }
+
+    /// Escape single quotes in SQL string values to prevent injection
+    /// Replaces ' with '' (SQL standard escape)
+    fn escape_sql_string(s: &str) -> String {
+        s.replace('\'', "''")
+    }
 }
 
 #[async_trait::async_trait]
@@ -226,22 +232,72 @@ impl mom_core::MemoryStore for SurrealDBStore {
         }))
     }
 
+    async fn get_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<Option<MemoryItem>> {
+        // SECURITY: Query with tenant_id filter to enforce multi-tenant isolation at DB level
+        // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
+        let safe_id = Self::escape_sql_string(&id.0);
+        let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
+        let query = format!(
+            "SELECT * FROM memory_items WHERE id = '{}' AND tenant_id = '{}'",
+            safe_id, safe_tenant
+        );
+        let results: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+
+        Ok(results.into_iter().next().map(|s| {
+            let content = match (s.content_text, s.content_json) {
+                (Some(text), None) => Content::Text(text),
+                (None, Some(json)) => Content::Json(json),
+                (Some(text), Some(json)) => Content::TextJson { text, json },
+                _ => Content::Text(String::new()),
+            };
+
+            let kind = Self::str_to_kind(&s.kind).unwrap_or(MemoryKind::Event);
+
+            MemoryItem {
+                id: MemoryId(s.id),
+                scope: mom_core::ScopeKey {
+                    tenant_id: s.tenant_id,
+                    workspace_id: s.workspace_id,
+                    project_id: s.project_id,
+                    agent_id: s.agent_id,
+                    run_id: s.run_id,
+                },
+                kind,
+                created_at_ms: s.created_at_ms,
+                content,
+                tags: s.tags,
+                importance: s.importance,
+                confidence: s.confidence,
+                source: s.source,
+                ttl_ms: s.ttl_ms,
+                meta: serde_json::from_value(s.meta).unwrap_or_default(),
+                embedding: s.embedding,
+                embedding_model: s.embedding_model,
+            }
+        }))
+    }
+
     async fn query(&self, q: Query) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
         // Build SurrealQL query with tenant filter + optional refinements
+        // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
+        let safe_tenant = Self::escape_sql_string(&q.scope.tenant_id);
         let mut query_str = format!(
             "SELECT * FROM memory_items WHERE tenant_id = '{}'",
-            &q.scope.tenant_id
+            safe_tenant
         );
 
         // Scope refinement
         if let Some(ref ws) = q.scope.workspace_id {
-            query_str.push_str(&format!(" AND workspace_id = '{}'", ws));
+            let safe_ws = Self::escape_sql_string(ws);
+            query_str.push_str(&format!(" AND workspace_id = '{}'", safe_ws));
         }
         if let Some(ref proj) = q.scope.project_id {
-            query_str.push_str(&format!(" AND project_id = '{}'", proj));
+            let safe_proj = Self::escape_sql_string(proj);
+            query_str.push_str(&format!(" AND project_id = '{}'", safe_proj));
         }
         if let Some(ref agent) = q.scope.agent_id {
-            query_str.push_str(&format!(" AND agent_id = '{}'", agent));
+            let safe_agent = Self::escape_sql_string(agent);
+            query_str.push_str(&format!(" AND agent_id = '{}'", safe_agent));
         }
 
         // Kind filter
@@ -265,9 +321,10 @@ impl mom_core::MemoryStore for SurrealDBStore {
 
         // Text match (simple substring for MVP; enhance with FTS later)
         if !q.text.is_empty() {
+            let safe_text = Self::escape_sql_string(&q.text);
             query_str.push_str(&format!(
                 " AND (content_text CONTAINS '{}' OR tags CONTAINS ['{}'])",
-                &q.text, &q.text
+                safe_text, safe_text
             ));
         }
 
@@ -331,6 +388,21 @@ impl mom_core::MemoryStore for SurrealDBStore {
         Ok(())
     }
 
+    async fn delete_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<()> {
+        // SECURITY: Delete with tenant_id filter to enforce multi-tenant isolation at DB level
+        // This ensures we can only delete items that belong to the calling tenant
+        // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
+        let safe_id = Self::escape_sql_string(&id.0);
+        let safe_tenant = Self::escape_sql_string(&scope.tenant_id);
+        let query = format!(
+            "DELETE memory_items WHERE id = '{}' AND tenant_id = '{}'",
+            safe_id, safe_tenant
+        );
+        let _: Vec<StoredItem> = self.db.query(&query).await?.take(0)?;
+        debug!("Deleted memory item scoped to tenant: {} (id: {})", scope.tenant_id, id.0);
+        Ok(())
+    }
+
     /// Vector-based semantic search (Phase 2d)
     async fn vector_recall(
         &self,
@@ -372,27 +444,33 @@ async fn lexical_recall(
     limit: usize,
 ) -> anyhow::Result<Vec<(String, f32)>> {
     // Build SurrealQL query for full-text search
+    // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
+    let safe_tenant = SurrealDBStore::escape_sql_string(&scope.tenant_id);
     let mut query_str = format!(
         "SELECT id, importance FROM memory_items WHERE tenant_id = '{}'",
-        &scope.tenant_id
+        safe_tenant
     );
 
     // Apply scope refinements
     if let Some(ref ws) = scope.workspace_id {
-        query_str.push_str(&format!(" AND workspace_id = '{}'", ws));
+        let safe_ws = SurrealDBStore::escape_sql_string(ws);
+        query_str.push_str(&format!(" AND workspace_id = '{}'", safe_ws));
     }
     if let Some(ref proj) = scope.project_id {
-        query_str.push_str(&format!(" AND project_id = '{}'", proj));
+        let safe_proj = SurrealDBStore::escape_sql_string(proj);
+        query_str.push_str(&format!(" AND project_id = '{}'", safe_proj));
     }
     if let Some(ref agent) = scope.agent_id {
-        query_str.push_str(&format!(" AND agent_id = '{}'", agent));
+        let safe_agent = SurrealDBStore::escape_sql_string(agent);
+        query_str.push_str(&format!(" AND agent_id = '{}'", safe_agent));
     }
 
     // Text match: search in content_text or tags
     if !query_text.is_empty() {
+        let safe_text = SurrealDBStore::escape_sql_string(query_text);
         query_str.push_str(&format!(
             " AND (content_text CONTAINS '{}' OR tags CONTAINS ['{}'])",
-            query_text, query_text
+            safe_text, safe_text
         ));
     }
 
@@ -421,20 +499,25 @@ async fn semantic_recall(
     limit: usize,
 ) -> anyhow::Result<Vec<(String, f32)>> {
     // Vector similarity search - fetch all items with embeddings and compute cosine similarity
+    // Note: Using escaped string literals for safety. Future: migrate to parameterized queries.
+    let safe_tenant = SurrealDBStore::escape_sql_string(&scope.tenant_id);
     let mut query_str = format!(
         "SELECT id, embedding FROM memory_items WHERE tenant_id = '{}' AND embedding IS NOT NULL",
-        &scope.tenant_id
+        safe_tenant
     );
 
     // Apply scope refinements
     if let Some(ref ws) = scope.workspace_id {
-        query_str.push_str(&format!(" AND workspace_id = '{}'", ws));
+        let safe_ws = SurrealDBStore::escape_sql_string(ws);
+        query_str.push_str(&format!(" AND workspace_id = '{}'", safe_ws));
     }
     if let Some(ref proj) = scope.project_id {
-        query_str.push_str(&format!(" AND project_id = '{}'", proj));
+        let safe_proj = SurrealDBStore::escape_sql_string(proj);
+        query_str.push_str(&format!(" AND project_id = '{}'", safe_proj));
     }
     if let Some(ref agent) = scope.agent_id {
-        query_str.push_str(&format!(" AND agent_id = '{}'", agent));
+        let safe_agent = SurrealDBStore::escape_sql_string(agent);
+        query_str.push_str(&format!(" AND agent_id = '{}'", safe_agent));
     }
 
     // Order by created_at_ms for stable ordering before similarity computation

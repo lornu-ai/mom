@@ -86,10 +86,26 @@ async fn put_memory(
 async fn get_memory(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<MemoryItem>, ApiError> {
+    // SECURITY: Require tenant_id from query parameter (will be from auth context in US-17)
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
+    let scope = ScopeKey {
+        tenant_id,
+        workspace_id: params.get("workspace_id").map(|s| s.to_string()),
+        project_id: params.get("project_id").map(|s| s.to_string()),
+        agent_id: params.get("agent_id").map(|s| s.to_string()),
+        run_id: params.get("run_id").map(|s| s.to_string()),
+    };
+
+    // Use scoped get to enforce tenant isolation
     let item = st
         .store
-        .get(&MemoryId(id))
+        .get_scoped(&MemoryId(id), &scope)
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(item))
@@ -101,8 +117,8 @@ async fn list_memories(
 ) -> Result<Json<Vec<MemoryItem>>, ApiError> {
     let tenant_id = params
         .get("tenant_id")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "default".to_string());
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
 
     // Parse kinds filter (comma-separated: event,summary,fact,preference)
     let kinds = params.get("kinds").and_then(|k| {
@@ -163,8 +179,24 @@ async fn list_memories(
 async fn delete_memory(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode, ApiError> {
-    st.store.delete(&MemoryId(id)).await?;
+    // SECURITY: Require tenant_id from query parameter (will be from auth context in US-17)
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
+    let scope = ScopeKey {
+        tenant_id,
+        workspace_id: params.get("workspace_id").map(|s| s.to_string()),
+        project_id: params.get("project_id").map(|s| s.to_string()),
+        agent_id: params.get("agent_id").map(|s| s.to_string()),
+        run_id: params.get("run_id").map(|s| s.to_string()),
+    };
+
+    // Use scoped delete to enforce tenant isolation
+    st.store.delete_scoped(&MemoryId(id), &scope).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
