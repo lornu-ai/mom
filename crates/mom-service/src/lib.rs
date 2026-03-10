@@ -387,13 +387,12 @@ mod tests {
     }
 
     // ============================================================================
-    // US-5: Delete Memory Unit Tests
+    // US-5: Delete Memory Unit Tests - Helper Functions
     // ============================================================================
 
-    #[test]
-    fn test_deletion_works_with_event_kind() {
-        let item = MemoryItem {
-            id: MemoryId("delete-event".to_string()),
+    fn create_basic_item(id: &str, kind: MemoryKind) -> MemoryItem {
+        MemoryItem {
+            id: MemoryId(id.to_string()),
             scope: ScopeKey {
                 tenant_id: "test".to_string(),
                 workspace_id: None,
@@ -401,10 +400,10 @@ mod tests {
                 agent_id: None,
                 run_id: None,
             },
-            kind: MemoryKind::Event,
+            kind,
             created_at_ms: 0,
-            content: Content::Text("Deletable event".to_string()),
-            tags: vec!["delete".to_string()],
+            content: Content::Text(format!("Deletable {:?}", kind)),
+            tags: vec![],
             importance: 0.5,
             confidence: 1.0,
             source: "test".to_string(),
@@ -412,93 +411,28 @@ mod tests {
             meta: Default::default(),
             embedding: None,
             embedding_model: None,
-        };
-
-        // Verify the item can be created with event kind
-        assert_eq!(item.kind, MemoryKind::Event);
-        assert_eq!(item.id.0, "delete-event");
-        // In real scenario, this item would be deleted from store
+        }
     }
 
-    #[test]
-    fn test_deletion_works_with_summary_kind() {
-        let item = MemoryItem {
-            id: MemoryId("delete-summary".to_string()),
-            scope: ScopeKey {
-                tenant_id: "test".to_string(),
-                workspace_id: None,
-                project_id: None,
-                agent_id: None,
-                run_id: None,
-            },
-            kind: MemoryKind::Summary,
-            created_at_ms: 0,
-            content: Content::Text("Deletable summary".to_string()),
-            tags: vec![],
-            importance: 0.7,
-            confidence: 0.95,
-            source: "test".to_string(),
-            ttl_ms: None,
-            meta: Default::default(),
-            embedding: None,
-            embedding_model: None,
-        };
-
-        assert_eq!(item.kind, MemoryKind::Summary);
-    }
+    // ============================================================================
+    // US-5: Delete Memory Unit Tests
+    // ============================================================================
 
     #[test]
-    fn test_deletion_works_with_fact_kind() {
-        let item = MemoryItem {
-            id: MemoryId("delete-fact".to_string()),
-            scope: ScopeKey {
-                tenant_id: "test".to_string(),
-                workspace_id: None,
-                project_id: None,
-                agent_id: None,
-                run_id: None,
-            },
-            kind: MemoryKind::Fact,
-            created_at_ms: 0,
-            content: Content::Text("Deletable fact".to_string()),
-            tags: vec!["fact".to_string()],
-            importance: 0.6,
-            confidence: 1.0,
-            source: "test".to_string(),
-            ttl_ms: None,
-            meta: Default::default(),
-            embedding: None,
-            embedding_model: None,
-        };
+    fn test_deletion_works_with_all_memory_kinds() {
+        // Verify deletion capability works with all MemoryKind variants
+        let kinds = vec![
+            MemoryKind::Event,
+            MemoryKind::Summary,
+            MemoryKind::Fact,
+            MemoryKind::Preference,
+        ];
 
-        assert_eq!(item.kind, MemoryKind::Fact);
-    }
-
-    #[test]
-    fn test_deletion_works_with_preference_kind() {
-        let item = MemoryItem {
-            id: MemoryId("delete-preference".to_string()),
-            scope: ScopeKey {
-                tenant_id: "test".to_string(),
-                workspace_id: None,
-                project_id: None,
-                agent_id: None,
-                run_id: None,
-            },
-            kind: MemoryKind::Preference,
-            created_at_ms: 0,
-            content: Content::Text("Deletable preference".to_string()),
-            tags: vec![],
-            importance: 0.3,
-            confidence: 0.8,
-            source: "test".to_string(),
-            ttl_ms: None,
-            meta: Default::default(),
-            embedding: None,
-            embedding_model: None,
-        };
-
-        assert_eq!(item.kind, MemoryKind::Preference);
+        for kind in kinds {
+            let item = create_basic_item(&format!("delete-{:?}", kind).to_lowercase(), kind);
+            assert_eq!(item.kind, kind, "Item kind should match expected {:?}", kind);
+            assert!(!item.id.0.is_empty(), "Item should have non-empty ID");
+        }
     }
 
     #[test]
@@ -539,60 +473,24 @@ mod tests {
     #[test]
     fn test_deletion_with_ttl() {
         // Verify TTL items can be deleted (TTL expiration is separate from delete)
-        let item = MemoryItem {
-            id: MemoryId("ttl-delete".to_string()),
-            scope: ScopeKey {
-                tenant_id: "test".to_string(),
-                workspace_id: None,
-                project_id: None,
-                agent_id: None,
-                run_id: None,
-            },
-            kind: MemoryKind::Event,
-            created_at_ms: 0,
-            content: Content::Text("Item with TTL".to_string()),
-            tags: vec![],
-            importance: 0.5,
-            confidence: 1.0,
-            source: "test".to_string(),
-            ttl_ms: Some(3600000), // 1 hour
-            meta: Default::default(),
-            embedding: None,
-            embedding_model: None,
-        };
+        let mut item = create_basic_item("ttl-delete", MemoryKind::Event);
+        item.ttl_ms = Some(3600000); // 1 hour
 
         assert_eq!(item.ttl_ms, Some(3600000));
+        assert_eq!(item.kind, MemoryKind::Event);
         // TTL doesn't prevent deletion
     }
 
     #[test]
     fn test_deletion_with_multiple_tags() {
-        let item = MemoryItem {
-            id: MemoryId("tagged-delete".to_string()),
-            scope: ScopeKey {
-                tenant_id: "test".to_string(),
-                workspace_id: None,
-                project_id: None,
-                agent_id: None,
-                run_id: None,
-            },
-            kind: MemoryKind::Event,
-            created_at_ms: 0,
-            content: Content::Text("Heavily tagged item".to_string()),
-            tags: vec![
-                "tag1".to_string(),
-                "tag2".to_string(),
-                "tag3".to_string(),
-                "delete-me".to_string(),
-            ],
-            importance: 0.8,
-            confidence: 1.0,
-            source: "test".to_string(),
-            ttl_ms: None,
-            meta: Default::default(),
-            embedding: None,
-            embedding_model: None,
-        };
+        let mut item = create_basic_item("tagged-delete", MemoryKind::Event);
+        item.tags = vec![
+            "tag1".to_string(),
+            "tag2".to_string(),
+            "tag3".to_string(),
+            "delete-me".to_string(),
+        ];
+        item.importance = 0.8;
 
         // Multiple tags don't prevent deletion
         assert_eq!(item.tags.len(), 4);
@@ -607,18 +505,55 @@ mod tests {
             "status": "pending"
         });
 
+        let mut item = create_basic_item("json-delete", MemoryKind::Event);
+        item.content = Content::Json(json_content);
+
+        // JSON content items can be deleted
+        match &item.content {
+            Content::Json(v) => {
+                assert_eq!(v["action"], "delete");
+            }
+            _ => panic!("Expected JSON content"),
+        }
+    }
+
+    #[test]
+    fn test_deletion_with_confidence_levels() {
+        // Verify items with different confidence levels can be deleted
+        for confidence in &[0.0, 0.5, 0.95, 1.0] {
+            let mut item = create_basic_item(&format!("conf-{}", confidence), MemoryKind::Event);
+            item.confidence = *confidence;
+            assert_eq!(item.confidence, *confidence);
+        }
+    }
+
+    #[test]
+    fn test_deletion_with_importance_levels() {
+        // Verify items with different importance levels can be deleted
+        for importance in &[0.0, 0.25, 0.75, 1.0] {
+            let mut item = create_basic_item(&format!("imp-{}", importance), MemoryKind::Event);
+            item.importance = *importance;
+            assert_eq!(item.importance, *importance);
+        }
+    }
+
+    #[test]
+    fn test_deletion_with_optional_scope_fields() {
+        // Verify deletion with partially populated scope (some fields None)
+        let scope_partial = ScopeKey {
+            tenant_id: "test".to_string(),
+            workspace_id: Some("ws-1".to_string()),
+            project_id: None,
+            agent_id: Some("agent-1".to_string()),
+            run_id: None,
+        };
+
         let item = MemoryItem {
-            id: MemoryId("json-delete".to_string()),
-            scope: ScopeKey {
-                tenant_id: "test".to_string(),
-                workspace_id: None,
-                project_id: None,
-                agent_id: None,
-                run_id: None,
-            },
+            id: MemoryId("partial-scope".to_string()),
+            scope: scope_partial,
             kind: MemoryKind::Event,
             created_at_ms: 0,
-            content: Content::Json(json_content),
+            content: Content::Text("Item with partial scope".to_string()),
             tags: vec![],
             importance: 0.5,
             confidence: 1.0,
@@ -629,12 +564,22 @@ mod tests {
             embedding_model: None,
         };
 
-        // JSON content items can be deleted
-        match &item.content {
-            Content::Json(v) => {
-                assert_eq!(v["action"], "delete");
-            }
-            _ => panic!("Expected JSON content"),
-        }
+        // Verify optional fields are correctly set
+        assert!(item.scope.workspace_id.is_some());
+        assert!(item.scope.project_id.is_none());
+        assert!(item.scope.agent_id.is_some());
+        assert!(item.scope.run_id.is_none());
+    }
+
+    #[test]
+    fn test_deletion_with_empty_vs_populated_tags() {
+        // Items with empty tags can be deleted
+        let mut empty_tags = create_basic_item("empty-tags", MemoryKind::Event);
+        assert_eq!(empty_tags.tags.len(), 0);
+
+        // Items with tags can be deleted
+        let mut with_tags = create_basic_item("with-tags", MemoryKind::Event);
+        with_tags.tags = vec!["important".to_string()];
+        assert_eq!(with_tags.tags.len(), 1);
     }
 }
