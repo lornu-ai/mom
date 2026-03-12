@@ -669,10 +669,9 @@ mod tests {
     #[test]
     fn test_semantic_search_endpoint_url_routing() {
         // Verify the semantic-search endpoint would be registered
-        // This test just validates the request/response types work
+        // This test validates the request/response types work (tenant_id comes from query param)
         let req = SemanticSearchRequest {
             query: "test query".to_string(),
-            scope_tenant_id: "test-tenant".to_string(),
             limit: Some(10),
         };
 
