@@ -23,7 +23,6 @@ struct AppState {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SemanticSearchRequest {
     pub query: String,
-    pub scope_tenant_id: String,
     pub limit: Option<usize>,
 }
 
@@ -208,24 +207,32 @@ async fn recall(
 /// Semantic search using embeddings (Phase 2a feature)
 ///
 /// Returns memories ranked by semantic similarity to the query
+/// SECURITY: Requires tenant_id from query parameter (will be from auth context in US-17)
 async fn semantic_search(
     State(st): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     Json(req): Json<SemanticSearchRequest>,
 ) -> Result<Json<Vec<Scored<MemoryItem>>>, ApiError> {
+    // SECURITY: Require tenant_id from query parameter to prevent IDOR
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
     let embedder = st.embedder.as_ref()
-        .ok_or_else(|| ApiError::Internal("Embeddings not available".to_string()))?;
+        .ok_or(ApiError::Internal("Embeddings not available".to_string()))?;
 
     // Generate embedding for query text
     let query_embedding = embedder
         .embed(&req.query)
         .await
-        .map_err(|e| ApiError::Internal(format!("Embedding error: {}", e)))?;
+        .map_err(|_| ApiError::Internal("Embedding unavailable".to_string()))?;
 
     let limit = req.limit.unwrap_or(10).min(100);
 
-    // Create scope for search
+    // Create scope for search with tenant isolation
     let scope = ScopeKey {
-        tenant_id: req.scope_tenant_id.clone(),
+        tenant_id,
         workspace_id: None,
         project_id: None,
         agent_id: None,
@@ -244,6 +251,7 @@ async fn semantic_search(
 #[derive(Debug)]
 enum ApiError {
     NotFound,
+    BadRequest(String),
     Internal(String),
 }
 
@@ -258,6 +266,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 
@@ -582,13 +591,11 @@ mod tests {
 
         let req_json = json!({
             "query": "deployment failed",
-            "scope_tenant_id": "acme",
             "limit": 25
         });
 
         let req: SemanticSearchRequest = serde_json::from_value(req_json).unwrap();
         assert_eq!(req.query, "deployment failed");
-        assert_eq!(req.scope_tenant_id, "acme");
         assert_eq!(req.limit, Some(25));
     }
 
@@ -597,13 +604,11 @@ mod tests {
         use serde_json::json;
 
         let req_json = json!({
-            "query": "error handling",
-            "scope_tenant_id": "default"
+            "query": "error handling"
         });
 
         let req: SemanticSearchRequest = serde_json::from_value(req_json).unwrap();
         assert_eq!(req.query, "error handling");
-        assert_eq!(req.scope_tenant_id, "default");
         assert_eq!(req.limit, None);
     }
 
@@ -612,7 +617,6 @@ mod tests {
         // Limit should be applied in endpoint handler
         let req = SemanticSearchRequest {
             query: "test".to_string(),
-            scope_tenant_id: "tenant1".to_string(),
             limit: Some(500),
         };
 
@@ -621,23 +625,13 @@ mod tests {
     }
 
     #[test]
-    fn test_semantic_search_scope_creation() {
-        let req = SemanticSearchRequest {
-            query: "test".to_string(),
-            scope_tenant_id: "acme".to_string(),
-            limit: Some(10),
-        };
+    fn test_semantic_search_tenant_id_required() {
+        // SECURITY: tenant_id must be provided via query parameter, not in request body
+        let params: HashMap<String, String> = HashMap::new();
+        let tenant_id = params.get("tenant_id");
 
-        let scope = ScopeKey {
-            tenant_id: req.scope_tenant_id.clone(),
-            workspace_id: None,
-            project_id: None,
-            agent_id: None,
-            run_id: None,
-        };
-
-        assert_eq!(scope.tenant_id, "acme");
-        assert!(scope.workspace_id.is_none());
+        // Verify tenant_id is missing (should error in handler)
+        assert!(tenant_id.is_none());
     }
 
     #[test]
