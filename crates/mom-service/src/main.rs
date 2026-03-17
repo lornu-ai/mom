@@ -10,17 +10,37 @@ use mom_store_surrealdb::SurrealDBStore;
 use mom_embeddings::create_embedder;
 use mom_sources::{IngestionScheduler, MemorySource, OxidizedRAGSource, OxidizedGraphSource, DataFabricSource};
 use std::sync::Arc;
+use std::collections::HashMap;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, error, warn};
 use serde::{Deserialize, Serialize};
 
+/// Registry of memory sources indexed by source ID
+#[derive(Clone)]
+struct SourceRegistry {
+    sources: Arc<HashMap<String, Arc<Box<dyn MemorySource>>>>,
+}
+
+impl SourceRegistry {
+    fn new() -> Self {
+        Self {
+            sources: Arc::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, source_id: &str) -> Option<Arc<Box<dyn MemorySource>>> {
+        self.sources.get(source_id).cloned()
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     store: Arc<SurrealDBStore>,
     embedder: Option<Arc<Box<dyn Embedder>>>,
     ingestion_scheduler: Arc<Mutex<IngestionScheduler>>,
+    source_registry: SourceRegistry,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,6 +69,18 @@ pub struct IngestionResponse {
 pub struct IngestionStatus {
     pub sources: usize,
     pub poll_interval_secs: u64,
+}
+
+/// Get source endpoint URL from environment or use default
+fn get_source_endpoint(source_name: &str, default: &str) -> String {
+    let env_var = match source_name {
+        "oxidizedrag" => "OXIDIZEDRAG_URL",
+        "oxidizedgraph" => "OXIDIZEDGRAPH_URL",
+        "datafabric" => "DATAFABRIC_URL",
+        _ => return default.to_string(),
+    };
+
+    std::env::var(env_var).unwrap_or_else(|_| default.to_string())
 }
 
 #[tokio::main]
@@ -85,27 +117,43 @@ async fn main() -> anyhow::Result<()> {
     // Initialize ingestion scheduler with sources
     let mut scheduler = IngestionScheduler::new(300); // 5-minute poll interval
 
-    // Register all memory sources
-    let rag_source: Box<dyn MemorySource> = Box::new(
-        OxidizedRAGSource::new("http://localhost:8001".to_string())
-    );
-    let graph_source: Box<dyn MemorySource> = Box::new(
-        OxidizedGraphSource::new("http://localhost:8002".to_string())
-    );
-    let fabric_source: Box<dyn MemorySource> = Box::new(
-        DataFabricSource::new("http://localhost:8003".to_string())
-    );
+    // Get source endpoints from environment or use defaults
+    let rag_endpoint = get_source_endpoint("oxidizedrag", "http://localhost:8001");
+    let graph_endpoint = get_source_endpoint("oxidizedgraph", "http://localhost:8002");
+    let fabric_endpoint = get_source_endpoint("datafabric", "http://localhost:8003");
 
-    scheduler.register_source(rag_source);
-    scheduler.register_source(graph_source);
-    scheduler.register_source(fabric_source);
+    info!("Initializing ingestion sources:");
+    info!("  oxidizedrag  : {}", rag_endpoint);
+    info!("  oxidizedgraph: {}", graph_endpoint);
+    info!("  datafabric   : {}", fabric_endpoint);
+
+    // Create all memory sources
+    let rag_source = Arc::new(Box::new(OxidizedRAGSource::new(rag_endpoint)) as Box<dyn MemorySource>);
+    let graph_source = Arc::new(Box::new(OxidizedGraphSource::new(graph_endpoint)) as Box<dyn MemorySource>);
+    let fabric_source = Arc::new(Box::new(DataFabricSource::new(fabric_endpoint)) as Box<dyn MemorySource>);
+
+    // Register sources with scheduler
+    scheduler.register_source(Box::new(OxidizedRAGSource::new(get_source_endpoint("oxidizedrag", "http://localhost:8001"))));
+    scheduler.register_source(Box::new(OxidizedGraphSource::new(get_source_endpoint("oxidizedgraph", "http://localhost:8002"))));
+    scheduler.register_source(Box::new(DataFabricSource::new(get_source_endpoint("datafabric", "http://localhost:8003"))));
 
     info!("✅ Ingestion scheduler initialized with {} sources", scheduler.source_count());
+
+    // Build source registry for handlers
+    let mut source_registry_map = HashMap::new();
+    source_registry_map.insert("oxidizedrag".to_string(), rag_source);
+    source_registry_map.insert("oxidizedgraph".to_string(), graph_source);
+    source_registry_map.insert("datafabric".to_string(), fabric_source);
+
+    let source_registry = SourceRegistry {
+        sources: Arc::new(source_registry_map),
+    };
 
     let state = AppState {
         store: Arc::new(store),
         embedder,
         ingestion_scheduler: Arc::new(Mutex::new(scheduler)),
+        source_registry,
     };
 
     // Build router
@@ -477,28 +525,13 @@ async fn ingest_source(
 
     info!("Starting ingestion from source: {}", source);
 
-    // Try to fetch from each source until we find a match
-    // This is a simplified approach; in production, we'd have better source resolution
-    let memories = match source.as_str() {
-        "oxidizedrag" => {
-            let rag = OxidizedRAGSource::new("http://localhost:8001".to_string());
-            rag.fetch_memories(&scope, None).await
-                .map_err(|e| ApiError::Internal(format!("Failed to fetch from oxidizedrag: {}", e)))?
-        },
-        "oxidizedgraph" => {
-            let graph = OxidizedGraphSource::new("http://localhost:8002".to_string());
-            graph.fetch_memories(&scope, None).await
-                .map_err(|e| ApiError::Internal(format!("Failed to fetch from oxidizedgraph: {}", e)))?
-        },
-        "datafabric" => {
-            let fabric = DataFabricSource::new("http://localhost:8003".to_string());
-            fabric.fetch_memories(&scope, None).await
-                .map_err(|e| ApiError::Internal(format!("Failed to fetch from datafabric: {}", e)))?
-        },
-        _ => {
-            return Err(ApiError::BadRequest(format!("Unknown source: {}", source)));
-        }
-    };
+    // Get source from registry
+    let source_impl = st.source_registry.get(&source)
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown source: {}", source)))?;
+
+    // Fetch memories from the source
+    let memories = source_impl.fetch_memories(&scope, None).await
+        .map_err(|e| ApiError::Internal(format!("Failed to fetch from {}: {}", source, e)))?;
 
     let count = memories.len();
 
@@ -535,39 +568,42 @@ async fn ingest_all(
 
     let mut responses = Vec::new();
 
-    // Ingest from all three sources
-    let sources: Vec<(&str, Box<dyn MemorySource>)> = vec![
-        ("oxidizedrag", Box::new(OxidizedRAGSource::new("http://localhost:8001".to_string()))),
-        ("oxidizedgraph", Box::new(OxidizedGraphSource::new("http://localhost:8002".to_string()))),
-        ("datafabric", Box::new(DataFabricSource::new("http://localhost:8003".to_string()))),
-    ];
+    // Ingest from all registered sources in the registry
+    let source_ids = vec!["oxidizedrag", "oxidizedgraph", "datafabric"];
 
-    for (source_name, source) in sources {
-        match source.fetch_memories(&scope, None).await {
-            Ok(memories) => {
-                let count = memories.len();
+    for source_id in source_ids {
+        match st.source_registry.get(source_id) {
+            Some(source) => {
+                match source.fetch_memories(&scope, None).await {
+                    Ok(memories) => {
+                        let count = memories.len();
 
-                // Store all fetched memories
-                for memory in memories {
-                    if let Err(e) = st.store.put(memory).await {
-                        warn!("Failed to store memory from {}: {}", source_name, e);
+                        // Store all fetched memories
+                        for memory in memories {
+                            if let Err(e) = st.store.put(memory).await {
+                                warn!("Failed to store memory from {}: {}", source_id, e);
+                            }
+                        }
+
+                        info!("✅ Ingested {} memories from {}", count, source_id);
+                        responses.push(IngestionResponse {
+                            source: source_id.to_string(),
+                            count,
+                            message: format!("Successfully ingested {} memories", count),
+                        });
+                    },
+                    Err(e) => {
+                        warn!("⚠️  Failed to ingest from {}: {}", source_id, e);
+                        responses.push(IngestionResponse {
+                            source: source_id.to_string(),
+                            count: 0,
+                            message: format!("Failed: {}", e),
+                        });
                     }
                 }
-
-                info!("✅ Ingested {} memories from {}", count, source_name);
-                responses.push(IngestionResponse {
-                    source: source_name.to_string(),
-                    count,
-                    message: format!("Successfully ingested {} memories", count),
-                });
             },
-            Err(e) => {
-                warn!("⚠️  Failed to ingest from {}: {}", source_name, e);
-                responses.push(IngestionResponse {
-                    source: source_name.to_string(),
-                    count: 0,
-                    message: format!("Failed: {}", e),
-                });
+            None => {
+                warn!("⚠️  Source {} not found in registry", source_id);
             }
         }
     }
