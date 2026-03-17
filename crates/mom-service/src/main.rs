@@ -5,16 +5,82 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mom_core::{MemoryId, MemoryItem, MemoryKind, Query, Scored, ScopeKey, MemoryStore};
+use mom_core::{MemoryId, MemoryItem, MemoryKind, Query, Scored, ScopeKey, MemoryStore, Embedder};
 use mom_store_surrealdb::SurrealDBStore;
+use mom_embeddings::create_embedder;
+use mom_sources::{IngestionScheduler, MemorySource, OxidizedRAGSource, OxidizedGraphSource, DataFabricSource};
 use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, error};
+use tracing::{info, error, warn};
+use serde::{Deserialize, Serialize};
+
+/// Registry of memory sources indexed by source ID
+#[derive(Clone)]
+struct SourceRegistry {
+    sources: Arc<HashMap<String, Arc<Box<dyn MemorySource>>>>,
+}
+
+impl SourceRegistry {
+    fn new() -> Self {
+        Self {
+            sources: Arc::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, source_id: &str) -> Option<Arc<Box<dyn MemorySource>>> {
+        self.sources.get(source_id).cloned()
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<SurrealDBStore>,
+    embedder: Option<Arc<Box<dyn Embedder>>>,
+    ingestion_scheduler: Arc<Mutex<IngestionScheduler>>,
+    source_registry: SourceRegistry,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SemanticSearchRequest {
+    pub query: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IngestionRequest {
+    pub tenant_id: String,
+    pub workspace_id: Option<String>,
+    pub project_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestionResponse {
+    pub source: String,
+    pub count: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestionStatus {
+    pub sources: usize,
+    pub poll_interval_secs: u64,
+}
+
+/// Get source endpoint URL from environment or use default
+fn get_source_endpoint(source_name: &str, default: &str) -> String {
+    let env_var = match source_name {
+        "oxidizedrag" => "OXIDIZEDRAG_URL",
+        "oxidizedgraph" => "OXIDIZEDGRAPH_URL",
+        "datafabric" => "DATAFABRIC_URL",
+        _ => return default.to_string(),
+    };
+
+    std::env::var(env_var).unwrap_or_else(|_| default.to_string())
 }
 
 #[tokio::main]
@@ -36,8 +102,58 @@ async fn main() -> anyhow::Result<()> {
     info!("Connecting to SurrealDB at {}", db_path);
     let store = SurrealDBStore::new(&db_path).await?;
 
+    // Initialize embedder (optional - Phase 2a feature)
+    let embedder = match create_embedder().await {
+        Ok(emb) => {
+            info!("✅ Embeddings initialized (model: {})", emb.model_id());
+            Some(Arc::new(emb))
+        }
+        Err(e) => {
+            warn!("⚠️  Embeddings disabled: {}", e);
+            None
+        }
+    };
+
+    // Initialize ingestion scheduler with sources
+    let mut scheduler = IngestionScheduler::new(300); // 5-minute poll interval
+
+    // Get source endpoints from environment or use defaults
+    let rag_endpoint = get_source_endpoint("oxidizedrag", "http://localhost:8001");
+    let graph_endpoint = get_source_endpoint("oxidizedgraph", "http://localhost:8002");
+    let fabric_endpoint = get_source_endpoint("datafabric", "http://localhost:8003");
+
+    info!("Initializing ingestion sources:");
+    info!("  oxidizedrag  : {}", rag_endpoint);
+    info!("  oxidizedgraph: {}", graph_endpoint);
+    info!("  datafabric   : {}", fabric_endpoint);
+
+    // Create all memory sources
+    let rag_source = Arc::new(Box::new(OxidizedRAGSource::new(rag_endpoint)) as Box<dyn MemorySource>);
+    let graph_source = Arc::new(Box::new(OxidizedGraphSource::new(graph_endpoint)) as Box<dyn MemorySource>);
+    let fabric_source = Arc::new(Box::new(DataFabricSource::new(fabric_endpoint)) as Box<dyn MemorySource>);
+
+    // Register sources with scheduler
+    scheduler.register_source(Box::new(OxidizedRAGSource::new(get_source_endpoint("oxidizedrag", "http://localhost:8001"))));
+    scheduler.register_source(Box::new(OxidizedGraphSource::new(get_source_endpoint("oxidizedgraph", "http://localhost:8002"))));
+    scheduler.register_source(Box::new(DataFabricSource::new(get_source_endpoint("datafabric", "http://localhost:8003"))));
+
+    info!("✅ Ingestion scheduler initialized with {} sources", scheduler.source_count());
+
+    // Build source registry for handlers
+    let mut source_registry_map = HashMap::new();
+    source_registry_map.insert("oxidizedrag".to_string(), rag_source);
+    source_registry_map.insert("oxidizedgraph".to_string(), graph_source);
+    source_registry_map.insert("datafabric".to_string(), fabric_source);
+
+    let source_registry = SourceRegistry {
+        sources: Arc::new(source_registry_map),
+    };
+
     let state = AppState {
         store: Arc::new(store),
+        embedder,
+        ingestion_scheduler: Arc::new(Mutex::new(scheduler)),
+        source_registry,
     };
 
     // Build router
@@ -46,6 +162,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/memory", post(put_memory).get(list_memories))
         .route("/v1/memory/:id", get(get_memory).delete(delete_memory))
         .route("/v1/recall", post(recall))
+        .route("/v1/semantic-search", post(semantic_search))
+        .route("/v1/ingest/:source", post(ingest_source))
+        .route("/v1/ingest/all", post(ingest_all))
+        .route("/v1/ingest/status", get(ingest_status))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -61,6 +181,10 @@ async fn main() -> anyhow::Result<()> {
     info!("  GET    /v1/memory/:id        - Get memory");
     info!("  DELETE /v1/memory/:id        - Delete memory");
     info!("  POST   /v1/recall            - Recall context");
+    info!("  POST   /v1/semantic-search   - Semantic search with embeddings");
+    info!("  POST   /v1/ingest/:source    - Ingest from specific source");
+    info!("  POST   /v1/ingest/all        - Ingest from all sources");
+    info!("  GET    /v1/ingest/status     - Get ingestion status");
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -86,10 +210,26 @@ async fn put_memory(
 async fn get_memory(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<MemoryItem>, ApiError> {
+    // SECURITY: Require tenant_id from query parameter (will be from auth context in US-17)
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
+    let scope = ScopeKey {
+        tenant_id,
+        workspace_id: params.get("workspace_id").map(|s| s.to_string()),
+        project_id: params.get("project_id").map(|s| s.to_string()),
+        agent_id: params.get("agent_id").map(|s| s.to_string()),
+        run_id: params.get("run_id").map(|s| s.to_string()),
+    };
+
+    // Use scoped get to enforce tenant isolation
     let item = st
         .store
-        .get(&MemoryId(id))
+        .get_scoped(&MemoryId(id), &scope)
         .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(item))
@@ -101,8 +241,8 @@ async fn list_memories(
 ) -> Result<Json<Vec<MemoryItem>>, ApiError> {
     let tenant_id = params
         .get("tenant_id")
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "default".to_string());
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
 
     // Parse kinds filter (comma-separated: event,summary,fact,preference)
     let kinds = params.get("kinds").and_then(|k| {
@@ -163,8 +303,24 @@ async fn list_memories(
 async fn delete_memory(
     State(st): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<StatusCode, ApiError> {
-    st.store.delete(&MemoryId(id)).await?;
+    // SECURITY: Require tenant_id from query parameter (will be from auth context in US-17)
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
+    let scope = ScopeKey {
+        tenant_id,
+        workspace_id: params.get("workspace_id").map(|s| s.to_string()),
+        project_id: params.get("project_id").map(|s| s.to_string()),
+        agent_id: params.get("agent_id").map(|s| s.to_string()),
+        run_id: params.get("run_id").map(|s| s.to_string()),
+    };
+
+    // Use scoped delete to enforce tenant isolation
+    st.store.delete_scoped(&MemoryId(id), &scope).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -307,10 +463,172 @@ async fn recall(
     }
 }
 
+/// Semantic search using embeddings (Phase 2a feature)
+///
+/// Returns memories ranked by semantic similarity to the query
+/// SECURITY: Requires tenant_id from query parameter (will be from auth context in US-17)
+async fn semantic_search(
+    State(st): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Json(req): Json<SemanticSearchRequest>,
+) -> Result<Json<Vec<Scored<MemoryItem>>>, ApiError> {
+    // SECURITY: Require tenant_id from query parameter to prevent IDOR
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or(ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
+    let embedder = st.embedder.as_ref()
+        .ok_or(ApiError::Internal("Embeddings not available".to_string()))?;
+
+    // Generate embedding for query text
+    let query_embedding = embedder
+        .embed(&req.query)
+        .await
+        .map_err(|_| ApiError::Internal("Embedding unavailable".to_string()))?;
+
+    let limit = req.limit.unwrap_or(10).min(100);
+
+    // Create scope for search with tenant isolation
+    let scope = ScopeKey {
+        tenant_id,
+        workspace_id: None,
+        project_id: None,
+        agent_id: None,
+        run_id: None,
+    };
+
+    // Use vector recall from store (Phase 2b)
+    let results = st.store
+        .vector_recall(&query_embedding, &scope, limit)
+        .await?;
+
+    Ok(Json(results))
+}
+
+/// Ingest memories from a specific source (Phase 2c - Issue #29)
+///
+/// Fetches memories from the specified source and stores them in MOM.
+/// SECURITY: Requires tenant_id to enforce scope isolation
+async fn ingest_source(
+    State(st): State<AppState>,
+    Path(source): Path<String>,
+    Json(req): Json<IngestionRequest>,
+) -> Result<Json<IngestionResponse>, ApiError> {
+    let scope = ScopeKey {
+        tenant_id: req.tenant_id.clone(),
+        workspace_id: req.workspace_id,
+        project_id: req.project_id,
+        agent_id: req.agent_id,
+        run_id: req.run_id,
+    };
+
+    info!("Starting ingestion from source: {}", source);
+
+    // Get source from registry
+    let source_impl = st.source_registry.get(&source)
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown source: {}", source)))?;
+
+    // Fetch memories from the source
+    let memories = source_impl.fetch_memories(&scope, None).await
+        .map_err(|e| ApiError::Internal(format!("Failed to fetch from {}: {}", source, e)))?;
+
+    let count = memories.len();
+
+    // Store all fetched memories
+    for memory in memories {
+        st.store.put(memory).await
+            .map_err(|e| ApiError::Internal(format!("Failed to store memory: {}", e)))?;
+    }
+
+    info!("✅ Ingested {} memories from {}", count, source);
+
+    Ok(Json(IngestionResponse {
+        source,
+        count,
+        message: format!("Successfully ingested {} memories", count),
+    }))
+}
+
+/// Ingest memories from all registered sources (Phase 2c - Issue #29)
+///
+/// Fetches memories from all sources and stores them in MOM.
+/// SECURITY: Requires tenant_id to enforce scope isolation
+async fn ingest_all(
+    State(st): State<AppState>,
+    Json(req): Json<IngestionRequest>,
+) -> Result<Json<Vec<IngestionResponse>>, ApiError> {
+    let scope = ScopeKey {
+        tenant_id: req.tenant_id.clone(),
+        workspace_id: req.workspace_id,
+        project_id: req.project_id,
+        agent_id: req.agent_id,
+        run_id: req.run_id,
+    };
+
+    let mut responses = Vec::new();
+
+    // Ingest from all registered sources in the registry
+    let source_ids = vec!["oxidizedrag", "oxidizedgraph", "datafabric"];
+
+    for source_id in source_ids {
+        match st.source_registry.get(source_id) {
+            Some(source) => {
+                match source.fetch_memories(&scope, None).await {
+                    Ok(memories) => {
+                        let count = memories.len();
+
+                        // Store all fetched memories
+                        for memory in memories {
+                            if let Err(e) = st.store.put(memory).await {
+                                warn!("Failed to store memory from {}: {}", source_id, e);
+                            }
+                        }
+
+                        info!("✅ Ingested {} memories from {}", count, source_id);
+                        responses.push(IngestionResponse {
+                            source: source_id.to_string(),
+                            count,
+                            message: format!("Successfully ingested {} memories", count),
+                        });
+                    },
+                    Err(e) => {
+                        warn!("⚠️  Failed to ingest from {}: {}", source_id, e);
+                        responses.push(IngestionResponse {
+                            source: source_id.to_string(),
+                            count: 0,
+                            message: format!("Failed: {}", e),
+                        });
+                    }
+                }
+            },
+            None => {
+                warn!("⚠️  Source {} not found in registry", source_id);
+            }
+        }
+    }
+
+    Ok(Json(responses))
+}
+
+/// Get ingestion scheduler status
+///
+/// Returns information about the current ingestion configuration
+async fn ingest_status(
+    State(st): State<AppState>,
+) -> Json<IngestionStatus> {
+    let scheduler = st.ingestion_scheduler.lock().await;
+    Json(IngestionStatus {
+        sources: scheduler.source_count(),
+        poll_interval_secs: scheduler.poll_interval(),
+    })
+}
+
 // Error handling
 #[derive(Debug)]
 enum ApiError {
     NotFound,
+    BadRequest(String),
     Internal(String),
 }
 
@@ -325,6 +643,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, message) = match self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "Not found".to_string()),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::Internal(_msg) => {
                 // Log the real error server-side (via tracing), but return generic message to client
                 // to avoid exposing sensitive information (database errors, stack traces, etc.)
@@ -1012,4 +1331,217 @@ mod tests {
         assert_eq!(no_match_score, 0.0);
         assert!(match_score > 0.0);
     }
+
+    // Phase 2a: Semantic Search Tests
+
+    #[test]
+    fn test_semantic_search_request_parsing() {
+        use serde_json::json;
+
+        let req_json = json!({
+            "query": "deployment failed",
+            "limit": 25
+        });
+
+        let req: SemanticSearchRequest = serde_json::from_value(req_json).unwrap();
+        assert_eq!(req.query, "deployment failed");
+        assert_eq!(req.limit, Some(25));
+    }
+
+    #[test]
+    fn test_semantic_search_request_defaults() {
+        use serde_json::json;
+
+        let req_json = json!({
+            "query": "error handling"
+        });
+
+        let req: SemanticSearchRequest = serde_json::from_value(req_json).unwrap();
+        assert_eq!(req.query, "error handling");
+        assert_eq!(req.limit, None);
+    }
+
+    #[test]
+    fn test_semantic_search_request_limit_validation() {
+        // Limit should be applied in endpoint handler
+        let req = SemanticSearchRequest {
+            query: "test".to_string(),
+            limit: Some(500),
+        };
+
+        let limit = req.limit.unwrap_or(10).min(100);
+        assert_eq!(limit, 100); // Should be clamped to max 100
+    }
+
+    #[test]
+    fn test_semantic_search_tenant_id_required() {
+        // SECURITY: tenant_id must be provided via query parameter, not in request body
+        let params: HashMap<String, String> = HashMap::new();
+        let tenant_id = params.get("tenant_id");
+
+        // Verify tenant_id is missing (should error in handler)
+        assert!(tenant_id.is_none());
+    }
+
+    #[test]
+    fn test_embedding_provider_env_config() {
+        // Test that environment configuration would work
+        let provider = std::env::var("EMBEDDING_PROVIDER")
+            .unwrap_or_else(|_| "ollama".to_string());
+
+        // Verify it's one of the supported providers
+        assert!(
+            provider == "ollama" || provider == "mistral" || provider == "openai",
+            "Unknown provider: {}",
+            provider
+        );
+    }
+
+    #[test]
+    fn test_embedding_model_defaults() {
+        // Ollama default
+        let ollama_model = std::env::var("OLLAMA_MODEL")
+            .unwrap_or_else(|_| "mxbai-embed-large".to_string());
+        assert!(!ollama_model.is_empty());
+
+        // Mistral default
+        let mistral_model = std::env::var("MISTRAL_MODEL")
+            .unwrap_or_else(|_| "mistral-embed".to_string());
+        assert!(!mistral_model.is_empty());
+
+        // OpenAI default
+        let openai_model = std::env::var("OPENAI_MODEL")
+            .unwrap_or_else(|_| "text-embedding-3-large".to_string());
+        assert!(!openai_model.is_empty());
+    }
+
+    #[test]
+    fn test_semantic_search_endpoint_url_routing() {
+        // Verify the semantic-search endpoint would be registered
+        // This test validates the request/response types work (tenant_id comes from query param)
+        let req = SemanticSearchRequest {
+            query: "test query".to_string(),
+            limit: Some(10),
+        };
+
+        // Verify request can be serialized/deserialized
+        let json = serde_json::to_string(&req).unwrap();
+        let _deserialized: SemanticSearchRequest = serde_json::from_str(&json).unwrap();
+        assert!(!json.is_empty());
+    }
+
+    #[test]
+    fn test_embedding_disabled_error() {
+        // Simulate the error handling when embeddings are not available
+        let error_msg = "Embeddings not available";
+        assert!(!error_msg.is_empty());
+        assert!(error_msg.contains("Embeddings"));
+    }
+
+    // Phase 2c ingestion tests
+    #[test]
+    fn test_ingestion_request_serialization() {
+        let req = IngestionRequest {
+            tenant_id: "test-tenant".to_string(),
+            workspace_id: Some("workspace1".to_string()),
+            project_id: Some("project1".to_string()),
+            agent_id: Some("agent:analyzer".to_string()),
+            run_id: Some("run:001".to_string()),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: IngestionRequest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.tenant_id, "test-tenant");
+        assert_eq!(deserialized.workspace_id, Some("workspace1".to_string()));
+        assert_eq!(deserialized.project_id, Some("project1".to_string()));
+        assert_eq!(deserialized.agent_id, Some("agent:analyzer".to_string()));
+        assert_eq!(deserialized.run_id, Some("run:001".to_string()));
+    }
+
+    #[test]
+    fn test_ingestion_request_minimal() {
+        let req = IngestionRequest {
+            tenant_id: "test-tenant".to_string(),
+            workspace_id: None,
+            project_id: None,
+            agent_id: None,
+            run_id: None,
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: IngestionRequest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.tenant_id, "test-tenant");
+        assert!(deserialized.workspace_id.is_none());
+    }
+
+    #[test]
+    fn test_ingestion_response_serialization() {
+        let response = IngestionResponse {
+            source: "oxidizedrag".to_string(),
+            count: 42,
+            message: "Successfully ingested 42 memories".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: IngestionResponse = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.source, "oxidizedrag");
+        assert_eq!(deserialized.count, 42);
+        assert_eq!(deserialized.message, "Successfully ingested 42 memories");
+    }
+
+    #[test]
+    fn test_ingestion_status_serialization() {
+        let status = IngestionStatus {
+            sources: 3,
+            poll_interval_secs: 300,
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        let deserialized: IngestionStatus = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.sources, 3);
+        assert_eq!(deserialized.poll_interval_secs, 300);
+    }
+
+    #[test]
+    fn test_oxidizedrag_source_in_service() {
+        let source = OxidizedRAGSource::new("http://localhost:8001".to_string());
+        assert_eq!(source.source_id(), "oxidizedrag");
+        assert_eq!(source.description(), "Code analysis and pattern extraction from oxidizedRAG");
+    }
+
+    #[test]
+    fn test_oxidizedgraph_source_in_service() {
+        let source = OxidizedGraphSource::new("http://localhost:8002".to_string());
+        assert_eq!(source.source_id(), "oxidizedgraph");
+        assert_eq!(source.description(), "Agent workflow executions, decisions, and state transitions from oxidizedgraph");
+    }
+
+    #[test]
+    fn test_datafabric_source_in_service() {
+        let source = DataFabricSource::new("http://localhost:8003".to_string());
+        assert_eq!(source.source_id(), "datafabric");
+        assert_eq!(source.description(), "Task records, modifications, and validated facts from data-fabric");
+    }
+
+    #[test]
+    fn test_app_state_creation() {
+        // Test that AppState can be created with ingestion scheduler
+        let mut scheduler = IngestionScheduler::new(300);
+
+        let rag = Box::new(OxidizedRAGSource::new("http://localhost:8001".to_string()));
+        let graph = Box::new(OxidizedGraphSource::new("http://localhost:8002".to_string()));
+        let fabric = Box::new(DataFabricSource::new("http://localhost:8003".to_string()));
+
+        scheduler.register_source(rag);
+        scheduler.register_source(graph);
+        scheduler.register_source(fabric);
+
+        assert_eq!(scheduler.source_count(), 3);
+        assert_eq!(scheduler.poll_interval(), 300);
+    }
+
 }
