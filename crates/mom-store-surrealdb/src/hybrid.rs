@@ -31,8 +31,8 @@ pub struct HybridConfig {
 impl Default for HybridConfig {
     fn default() -> Self {
         Self {
-            lexical_weight: 0.5,
-            semantic_weight: 0.5,
+            lexical_weight: 0.7,
+            semantic_weight: 0.3,
             rrf_k: RRF_K,
         }
     }

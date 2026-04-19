@@ -50,6 +50,12 @@ pub struct SemanticSearchRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct HybridSearchRequest {
+    pub query: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct IngestionRequest {
     pub tenant_id: String,
     pub workspace_id: Option<String>,
@@ -163,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/memory/:id", get(get_memory).delete(delete_memory))
         .route("/v1/recall", post(recall))
         .route("/v1/semantic-search", post(semantic_search))
+        .route("/v1/hybrid-search", post(hybrid_search))
         .route("/v1/ingest/:source", post(ingest_source))
         .route("/v1/ingest/all", post(ingest_all))
         .route("/v1/ingest/status", get(ingest_status))
@@ -182,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
     info!("  DELETE /v1/memory/:id        - Delete memory");
     info!("  POST   /v1/recall            - Recall context");
     info!("  POST   /v1/semantic-search   - Vector semantic search");
+    info!("  POST   /v1/hybrid-search     - Hybrid lexical+vector recall (RRF)");
     info!("  POST   /v1/ingest/:source    - Ingest from source");
     info!("  POST   /v1/ingest/all        - Ingest from all sources");
     info!("  GET    /v1/ingest/status     - Ingestion status");
@@ -342,6 +350,57 @@ async fn semantic_search(
     // Use vector recall from store (Phase 2b)
     let results = st.store
         .vector_recall(&query_embedding, &scope, limit)
+        .await?;
+
+    Ok(Json(results))
+}
+
+/// Hybrid search combining lexical + semantic matching (Phase 2b feature)
+///
+/// Uses RRF (Reciprocal Rank Fusion) with 70% lexical + 30% semantic weighting
+/// Returns memories ranked by combined relevance
+async fn hybrid_search(
+    State(st): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Json(req): Json<HybridSearchRequest>,
+) -> Result<Json<Vec<Scored<MemoryItem>>>, ApiError> {
+    // Extract tenant_id from query params (security: prevents IDOR via request body)
+    let tenant_id = params
+        .get("tenant_id")
+        .ok_or_else(|| ApiError::BadRequest("tenant_id is required".to_string()))?
+        .to_string();
+
+    let embedder = st.embedder.as_ref()
+        .ok_or_else(|| ApiError::Internal("Embedding unavailable".to_string()))?;
+
+    // Generate embedding for query text
+    let query_embedding = embedder
+        .embed(&req.query)
+        .await
+        .map_err(|_| ApiError::Internal("Embedding unavailable".to_string()))?;
+
+    let limit = req.limit.unwrap_or(10).min(100);
+
+    // Create query for lexical + semantic fusion
+    let query = Query {
+        scope: ScopeKey {
+            tenant_id,
+            workspace_id: params.get("workspace_id").cloned(),
+            project_id: params.get("project_id").cloned(),
+            agent_id: params.get("agent_id").cloned(),
+            run_id: params.get("run_id").cloned(),
+        },
+        text: req.query,
+        kinds: None,
+        tags_any: None,
+        limit,
+        since_ms: None,
+        until_ms: None,
+    };
+
+    // Use hybrid recall from store (Phase 2b - RRF algorithm)
+    let results = st.store
+        .hybrid_recall(query, &query_embedding, limit)
         .await?;
 
     Ok(Json(results))
