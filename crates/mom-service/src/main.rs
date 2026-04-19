@@ -164,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Build router
     let app = Router::new()
+        .without_v07_checks()
         .route("/healthz", get(healthz))
         .route("/v1/memory", post(put_memory).get(list_memories))
         .route("/v1/memory/:id", get(get_memory).delete(delete_memory))
