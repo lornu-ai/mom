@@ -9,7 +9,7 @@
 //! - GET {endpoint}/v1/health → Health check
 
 use crate::MemorySource;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, ScopeKey};
 use serde::{Deserialize, Serialize};
@@ -99,57 +99,51 @@ impl MemorySource for DataFabricSource {
 
         // Fetch task records
         match self.client.get(&url).send().await {
-            Ok(response) => {
-                match response.json::<Vec<TaskRecord>>().await {
-                    Ok(tasks) => {
-                        for task in tasks {
-                            let memory = MemoryItem {
-                                id: MemoryId(format!("datafabric:task:{}", task.id)),
-                                scope: scope.clone(),
-                                kind: if task.status == "completed" {
-                                    MemoryKind::Fact
-                                } else {
-                                    MemoryKind::Event
-                                },
-                                created_at_ms: task.started_at,
-                                content: Content::TextJson {
-                                    text: format!("{}: {}", task.task_type, task.title),
-                                    json: serde_json::json!({
-                                        "type": "task",
-                                        "task_type": task.task_type,
-                                        "status": task.status,
-                                        "title": task.title,
-                                        "description": task.description,
-                                        "priority": task.priority,
-                                        "owner": task.owner
-                                    }),
-                                },
-                                tags: vec![
-                                    "task".to_string(),
-                                    task.task_type.clone(),
-                                    format!("priority:{}", task.priority),
-                                    "datafabric".to_string(),
-                                ],
-                                importance: (task.priority as f32) / 10.0,
-                                confidence: if task.status == "completed" {
-                                    1.0
-                                } else {
-                                    0.7
-                                },
-                                source: self.source_id().to_string(),
-                                ttl_ms: None,
-                                meta: BTreeMap::new(),
-                                embedding: None,
-                                embedding_model: None,
-                            };
-                            memories.push(memory);
-                        }
-                    }
-                    Err(e) => {
-                        return Err(anyhow!("Failed to parse data-fabric tasks response: {}", e));
+            Ok(response) => match response.json::<Vec<TaskRecord>>().await {
+                Ok(tasks) => {
+                    for task in tasks {
+                        let memory = MemoryItem {
+                            id: MemoryId(format!("datafabric:task:{}", task.id)),
+                            scope: scope.clone(),
+                            kind: if task.status == "completed" {
+                                MemoryKind::Fact
+                            } else {
+                                MemoryKind::Event
+                            },
+                            created_at_ms: task.started_at,
+                            content: Content::TextJson {
+                                text: format!("{}: {}", task.task_type, task.title),
+                                json: serde_json::json!({
+                                    "type": "task",
+                                    "task_type": task.task_type,
+                                    "status": task.status,
+                                    "title": task.title,
+                                    "description": task.description,
+                                    "priority": task.priority,
+                                    "owner": task.owner
+                                }),
+                            },
+                            tags: vec![
+                                "task".to_string(),
+                                task.task_type.clone(),
+                                format!("priority:{}", task.priority),
+                                "datafabric".to_string(),
+                            ],
+                            importance: (task.priority as f32) / 10.0,
+                            confidence: if task.status == "completed" { 1.0 } else { 0.7 },
+                            source: self.source_id().to_string(),
+                            ttl_ms: None,
+                            meta: BTreeMap::new(),
+                            embedding: None,
+                            embedding_model: None,
+                        };
+                        memories.push(memory);
                     }
                 }
-            }
+                Err(e) => {
+                    return Err(anyhow!("Failed to parse data-fabric tasks response: {}", e));
+                }
+            },
             Err(e) => {
                 return Err(anyhow!("Failed to call data-fabric API: {}", e));
             }

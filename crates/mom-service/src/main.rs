@@ -5,17 +5,19 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use mom_core::{MemoryId, MemoryItem, MemoryKind, Query, Scored, ScopeKey, MemoryStore, Embedder};
-use mom_store_surrealdb::SurrealDBStore;
+use mom_core::{Embedder, MemoryId, MemoryItem, MemoryKind, MemoryStore, Query, ScopeKey, Scored};
 use mom_embeddings::create_embedder;
-use mom_sources::{IngestionScheduler, MemorySource, OxidizedRAGSource, OxidizedGraphSource, DataFabricSource};
-use std::sync::Arc;
+use mom_sources::{
+    DataFabricSource, IngestionScheduler, MemorySource, OxidizedGraphSource, OxidizedRAGSource,
+};
+use mom_store_surrealdb::SurrealDBStore;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, error, warn};
-use serde::{Deserialize, Serialize};
+use tracing::{error, info, warn};
 
 /// Registry of memory sources indexed by source ID
 #[derive(Clone)]
@@ -94,16 +96,14 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("mom=debug".parse()?),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("mom=debug".parse()?),
         )
         .init();
 
     info!("🧠 MOM Service starting...");
 
     // Initialize SurrealDB store
-    let db_path = std::env::var("MOM_DB_PATH")
-        .unwrap_or_else(|_| "sqlite://mom.db".to_string());
+    let db_path = std::env::var("MOM_DB_PATH").unwrap_or_else(|_| "sqlite://mom.db".to_string());
 
     info!("Connecting to SurrealDB at {}", db_path);
     let store = SurrealDBStore::new(&db_path).await?;
@@ -134,16 +134,31 @@ async fn main() -> anyhow::Result<()> {
     info!("  datafabric   : {}", fabric_endpoint);
 
     // Create all memory sources
-    let rag_source = Arc::new(Box::new(OxidizedRAGSource::new(rag_endpoint)) as Box<dyn MemorySource>);
-    let graph_source = Arc::new(Box::new(OxidizedGraphSource::new(graph_endpoint)) as Box<dyn MemorySource>);
-    let fabric_source = Arc::new(Box::new(DataFabricSource::new(fabric_endpoint)) as Box<dyn MemorySource>);
+    let rag_source =
+        Arc::new(Box::new(OxidizedRAGSource::new(rag_endpoint)) as Box<dyn MemorySource>);
+    let graph_source =
+        Arc::new(Box::new(OxidizedGraphSource::new(graph_endpoint)) as Box<dyn MemorySource>);
+    let fabric_source =
+        Arc::new(Box::new(DataFabricSource::new(fabric_endpoint)) as Box<dyn MemorySource>);
 
     // Register sources with scheduler
-    scheduler.register_source(Box::new(OxidizedRAGSource::new(get_source_endpoint("oxidizedrag", "http://localhost:8001"))));
-    scheduler.register_source(Box::new(OxidizedGraphSource::new(get_source_endpoint("oxidizedgraph", "http://localhost:8002"))));
-    scheduler.register_source(Box::new(DataFabricSource::new(get_source_endpoint("datafabric", "http://localhost:8003"))));
+    scheduler.register_source(Box::new(OxidizedRAGSource::new(get_source_endpoint(
+        "oxidizedrag",
+        "http://localhost:8001",
+    ))));
+    scheduler.register_source(Box::new(OxidizedGraphSource::new(get_source_endpoint(
+        "oxidizedgraph",
+        "http://localhost:8002",
+    ))));
+    scheduler.register_source(Box::new(DataFabricSource::new(get_source_endpoint(
+        "datafabric",
+        "http://localhost:8003",
+    ))));
 
-    info!("✅ Ingestion scheduler initialized with {} sources", scheduler.source_count());
+    info!(
+        "✅ Ingestion scheduler initialized with {} sources",
+        scheduler.source_count()
+    );
 
     // Build source registry for handlers
     let mut source_registry_map = HashMap::new();
@@ -249,7 +264,9 @@ async fn list_memories(
                 _ => Err(()),
             })
             .collect();
-        parsed.ok().and_then(|v| if v.is_empty() { None } else { Some(v) })
+        parsed
+            .ok()
+            .and_then(|v| if v.is_empty() { None } else { Some(v) })
     });
 
     // Parse tags filter (comma-separated)
@@ -328,7 +345,9 @@ async fn semantic_search(
         .ok_or_else(|| ApiError::BadRequest("tenant_id is required".to_string()))?
         .to_string();
 
-    let embedder = st.embedder.as_ref()
+    let embedder = st
+        .embedder
+        .as_ref()
         .ok_or_else(|| ApiError::Internal("Embedding unavailable".to_string()))?;
 
     // Generate embedding for query text
@@ -349,7 +368,8 @@ async fn semantic_search(
     };
 
     // Use vector recall from store (Phase 2b)
-    let results = st.store
+    let results = st
+        .store
         .vector_recall(&query_embedding, &scope, limit)
         .await?;
 
@@ -371,7 +391,9 @@ async fn hybrid_search(
         .ok_or_else(|| ApiError::BadRequest("tenant_id is required".to_string()))?
         .to_string();
 
-    let embedder = st.embedder.as_ref()
+    let embedder = st
+        .embedder
+        .as_ref()
         .ok_or_else(|| ApiError::Internal("Embedding unavailable".to_string()))?;
 
     // Generate embedding for query text
@@ -400,7 +422,8 @@ async fn hybrid_search(
     };
 
     // Use hybrid recall from store (Phase 2b - RRF algorithm)
-    let results = st.store
+    let results = st
+        .store
         .hybrid_recall(query, &query_embedding, limit)
         .await?;
 
@@ -420,7 +443,10 @@ async fn ingest_source(
         Ok(Json(IngestionResponse {
             source: source.clone(),
             count,
-            message: format!("Ingestion triggered for {} (scope: {})", source, req.tenant_id),
+            message: format!(
+                "Ingestion triggered for {} (scope: {})",
+                source, req.tenant_id
+            ),
         }))
     } else {
         Err(ApiError::NotFound)
@@ -434,18 +460,17 @@ async fn ingest_all(
     let scheduler = st.ingestion_scheduler.lock().await;
     let count = scheduler.source_count();
 
-    Ok(Json(vec![
-        IngestionResponse {
-            source: "all".to_string(),
-            count,
-            message: format!("Ingestion triggered for {} sources (scope: {})", count, req.tenant_id),
-        }
-    ]))
+    Ok(Json(vec![IngestionResponse {
+        source: "all".to_string(),
+        count,
+        message: format!(
+            "Ingestion triggered for {} sources (scope: {})",
+            count, req.tenant_id
+        ),
+    }]))
 }
 
-async fn ingest_status(
-    State(st): State<AppState>,
-) -> Result<Json<IngestionStatus>, ApiError> {
+async fn ingest_status(State(st): State<AppState>) -> Result<Json<IngestionStatus>, ApiError> {
     let scheduler = st.ingestion_scheduler.lock().await;
     Ok(Json(IngestionStatus {
         sources: scheduler.source_count(),
@@ -512,7 +537,11 @@ mod tests {
         if tags.is_empty() || tags.iter().all(|s| s.is_empty()) {
             None
         } else {
-            Some(tags.into_iter().filter(|s: &String| !s.is_empty()).collect())
+            Some(
+                tags.into_iter()
+                    .filter(|s: &String| !s.is_empty())
+                    .collect(),
+            )
         }
     }
 
@@ -634,7 +663,10 @@ mod tests {
     #[test]
     fn test_parse_tags_with_empty_elements() {
         let tags = parse_tags("important,,urgent");
-        assert_eq!(tags, Some(vec!["important".to_string(), "urgent".to_string()]));
+        assert_eq!(
+            tags,
+            Some(vec!["important".to_string(), "urgent".to_string()])
+        );
     }
 
     #[test]
@@ -725,7 +757,9 @@ mod tests {
                     _ => Err(()),
                 })
                 .collect();
-            parsed.ok().and_then(|v: Vec<MemoryKind>| if v.is_empty() { None } else { Some(v) })
+            parsed
+                .ok()
+                .and_then(|v: Vec<MemoryKind>| if v.is_empty() { None } else { Some(v) })
         });
 
         let tags_any = params.get("tags").and_then(|t| {
@@ -733,7 +767,11 @@ mod tests {
             if tags.is_empty() || tags.iter().all(|s| s.is_empty()) {
                 None
             } else {
-                Some(tags.into_iter().filter(|s: &String| !s.is_empty()).collect())
+                Some(
+                    tags.into_iter()
+                        .filter(|s: &String| !s.is_empty())
+                        .collect(),
+                )
             }
         });
 
@@ -745,10 +783,7 @@ mod tests {
 
         let since_ms = params.get("since_ms").and_then(|s| s.parse().ok());
 
-        assert_eq!(
-            kinds,
-            Some(vec![MemoryKind::Event, MemoryKind::Summary])
-        );
+        assert_eq!(kinds, Some(vec![MemoryKind::Event, MemoryKind::Summary]));
         assert_eq!(
             tags_any,
             Some(vec!["important".to_string(), "urgent".to_string()])
@@ -772,8 +807,14 @@ mod tests {
             .unwrap_or_else(|| "default".to_string());
 
         assert_eq!(tenant_id, "acme");
-        assert_eq!(params.get("workspace_id").cloned(), Some("workspace1".to_string()));
-        assert_eq!(params.get("project_id").cloned(), Some("project1".to_string()));
+        assert_eq!(
+            params.get("workspace_id").cloned(),
+            Some("workspace1".to_string())
+        );
+        assert_eq!(
+            params.get("project_id").cloned(),
+            Some("project1".to_string())
+        );
         assert_eq!(params.get("agent_id").cloned(), Some("agent1".to_string()));
         assert_eq!(params.get("run_id").cloned(), Some("run1".to_string()));
     }
@@ -858,8 +899,7 @@ mod tests {
     #[test]
     fn test_embedding_provider_env_config() {
         // Test that environment configuration would work
-        let provider = std::env::var("EMBEDDING_PROVIDER")
-            .unwrap_or_else(|_| "ollama".to_string());
+        let provider = std::env::var("EMBEDDING_PROVIDER").unwrap_or_else(|_| "ollama".to_string());
 
         // Verify it's one of the supported providers
         assert!(
@@ -872,18 +912,18 @@ mod tests {
     #[test]
     fn test_embedding_model_defaults() {
         // Ollama default
-        let ollama_model = std::env::var("OLLAMA_MODEL")
-            .unwrap_or_else(|_| "mxbai-embed-large".to_string());
+        let ollama_model =
+            std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "mxbai-embed-large".to_string());
         assert!(!ollama_model.is_empty());
 
         // Mistral default
-        let mistral_model = std::env::var("MISTRAL_MODEL")
-            .unwrap_or_else(|_| "mistral-embed".to_string());
+        let mistral_model =
+            std::env::var("MISTRAL_MODEL").unwrap_or_else(|_| "mistral-embed".to_string());
         assert!(!mistral_model.is_empty());
 
         // OpenAI default
-        let openai_model = std::env::var("OPENAI_MODEL")
-            .unwrap_or_else(|_| "text-embedding-3-large".to_string());
+        let openai_model =
+            std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "text-embedding-3-large".to_string());
         assert!(!openai_model.is_empty());
     }
 
@@ -916,8 +956,16 @@ mod tests {
         ];
 
         for (input, expected) in test_cases {
-            let clamped = if input == 0 { 10 } else { Some(input).map(|l| l.min(100)).unwrap_or(10) };
-            assert_eq!(clamped, expected, "Input {} should map to {}", input, expected);
+            let clamped = if input == 0 {
+                10
+            } else {
+                Some(input).map(|l| l.min(100)).unwrap_or(10)
+            };
+            assert_eq!(
+                clamped, expected,
+                "Input {} should map to {}",
+                input, expected
+            );
         }
     }
 

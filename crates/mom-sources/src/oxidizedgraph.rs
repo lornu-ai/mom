@@ -9,7 +9,7 @@
 //! - GET {endpoint}/v1/health → Health check
 
 use crate::MemorySource;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, ScopeKey};
 use serde::{Deserialize, Serialize};
@@ -154,7 +154,9 @@ impl MemorySource for OxidizedGraphSource {
                                 content: Content::TextJson {
                                     text: format!(
                                         "State transition: {} → {} ({})",
-                                        transition.from_state, transition.to_state, transition.trigger
+                                        transition.from_state,
+                                        transition.to_state,
+                                        transition.trigger
                                     ),
                                     json: serde_json::json!({
                                         "type": "state_transition",

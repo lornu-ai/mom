@@ -8,7 +8,7 @@
 //! - GET {endpoint}/v1/health → Health check
 
 use crate::MemorySource;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, ScopeKey};
 use serde::{Deserialize, Serialize};
@@ -104,7 +104,10 @@ impl MemorySource for OxidizedRAGSource {
                                 kind: MemoryKind::Fact,
                                 created_at_ms: analysis.timestamp,
                                 content: Content::TextJson {
-                                    text: format!("Function {} at {}:{}", func.name, func.line_start, func.line_end),
+                                    text: format!(
+                                        "Function {} at {}:{}",
+                                        func.name, func.line_start, func.line_end
+                                    ),
                                     json: serde_json::json!({
                                         "type": "function",
                                         "name": func.name,
@@ -140,17 +143,17 @@ impl MemorySource for OxidizedRAGSource {
                                 kind: MemoryKind::Summary,
                                 created_at_ms: analysis.timestamp,
                                 content: Content::TextJson {
-                                    text: format!("Code patterns detected: {}", analysis.patterns.join(", ")),
+                                    text: format!(
+                                        "Code patterns detected: {}",
+                                        analysis.patterns.join(", ")
+                                    ),
                                     json: serde_json::json!({
                                         "type": "patterns",
                                         "patterns": analysis.patterns,
                                         "count": analysis.patterns.len()
                                     }),
                                 },
-                                tags: vec![
-                                    "pattern".to_string(),
-                                    "oxidizedrag".to_string(),
-                                ],
+                                tags: vec!["pattern".to_string(), "oxidizedrag".to_string()],
                                 importance: 0.6,
                                 confidence: analysis.confidence,
                                 source: self.source_id().to_string(),
@@ -199,9 +202,8 @@ mod tests {
 
     #[test]
     fn test_oxidizedrag_with_api_key() {
-        let source =
-            OxidizedRAGSource::new("http://localhost:8001".to_string())
-                .with_api_key("secret123".to_string());
+        let source = OxidizedRAGSource::new("http://localhost:8001".to_string())
+            .with_api_key("secret123".to_string());
         assert_eq!(source.api_key.as_deref(), Some("secret123"));
     }
 

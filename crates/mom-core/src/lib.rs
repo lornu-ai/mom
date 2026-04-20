@@ -47,11 +47,11 @@ pub struct MemoryItem {
     pub tags: Vec<String>,
 
     // ranking knobs
-    pub importance: f32,   // 0..1
-    pub confidence: f32,   // 0..1
+    pub importance: f32, // 0..1
+    pub confidence: f32, // 0..1
 
     // provenance / safety
-    pub source: String,    // "user" | "tool" | "agent" | "system"
+    pub source: String, // "user" | "tool" | "agent" | "system"
     pub ttl_ms: Option<i64>,
     pub meta: BTreeMap<String, serde_json::Value>,
 
@@ -90,7 +90,11 @@ pub trait MemoryStore: Send + Sync {
     /// Tenant-aware get: retrieves an item only if it belongs to the specified scope
     /// Returns None if item doesn't exist or doesn't belong to the tenant
     /// SECURITY: This method enforces multi-tenant isolation
-    async fn get_scoped(&self, id: &MemoryId, scope: &ScopeKey) -> anyhow::Result<Option<MemoryItem>> {
+    async fn get_scoped(
+        &self,
+        id: &MemoryId,
+        scope: &ScopeKey,
+    ) -> anyhow::Result<Option<MemoryItem>> {
         // Default implementation: get item and verify tenant match
         if let Some(item) = self.get(id).await? {
             if item.scope.tenant_id == scope.tenant_id {

@@ -3,8 +3,8 @@
 //! This library contains the request/response handlers and test suites.
 //! The main.rs binary uses these components to build the Axum service.
 
-use axum::response::IntoResponse;
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::json;
 use tracing::error;
@@ -41,7 +41,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mom_core::{MemoryId, MemoryItem, MemoryKind, ScopeKey, Content};
+    use mom_core::{Content, MemoryId, MemoryItem, MemoryKind, ScopeKey};
 
     #[test]
     fn test_memory_item_text_event() {
@@ -430,7 +430,11 @@ mod tests {
 
         for kind in kinds {
             let item = create_basic_item(&format!("delete-{:?}", kind).to_lowercase(), kind);
-            assert_eq!(item.kind, kind, "Item kind should match expected {:?}", kind);
+            assert_eq!(
+                item.kind, kind,
+                "Item kind should match expected {:?}",
+                kind
+            );
             assert!(!item.id.0.is_empty(), "Item should have non-empty ID");
         }
     }
@@ -775,7 +779,10 @@ mod tests {
 
         // Simulate isolation check: item should be accessible if tenants match
         let tenant_isolation_check = item_scope.tenant_id == request_scope.tenant_id;
-        assert!(tenant_isolation_check, "Should allow access when tenant matches");
+        assert!(
+            tenant_isolation_check,
+            "Should allow access when tenant matches"
+        );
     }
 
     // ============================================================================
@@ -1003,20 +1010,23 @@ mod tests {
 
         assert_eq!(response_json["source"], "oxidizedrag");
         assert_eq!(response_json["count"], 42);
-        assert!(response_json["message"].as_str().unwrap().contains("ingested"));
+        assert!(response_json["message"]
+            .as_str()
+            .unwrap()
+            .contains("ingested"));
     }
 
     #[test]
     fn test_ingestion_sources_are_unique() {
         // Verify each source has unique identifiers
-        let sources = vec![
-            "oxidizedrag",
-            "oxidizedgraph",
-            "datafabric",
-        ];
+        let sources = vec!["oxidizedrag", "oxidizedgraph", "datafabric"];
 
         let unique_sources: std::collections::HashSet<_> = sources.iter().cloned().collect();
-        assert_eq!(unique_sources.len(), 3, "All sources should have unique IDs");
+        assert_eq!(
+            unique_sources.len(),
+            3,
+            "All sources should have unique IDs"
+        );
     }
 
     #[test]
