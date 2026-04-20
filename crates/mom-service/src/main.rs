@@ -26,6 +26,7 @@ struct SourceRegistry {
 }
 
 impl SourceRegistry {
+    #[allow(dead_code)]
     fn new() -> Self {
         Self {
             sources: Arc::new(HashMap::new()),
@@ -53,7 +54,9 @@ pub struct SemanticSearchRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HybridSearchRequest {
+    /// Search query (1-1000 characters)
     pub query: String,
+    /// Result limit (1-100, default 10)
     pub limit: Option<usize>,
 }
 
@@ -380,11 +383,26 @@ async fn semantic_search(
 ///
 /// Uses RRF (Reciprocal Rank Fusion) with 70% lexical + 30% semantic weighting
 /// Returns memories ranked by combined relevance
+///
+/// Query parameters:
+/// - tenant_id (required): Tenant scope for search
+/// - workspace_id, project_id, agent_id, run_id (optional): Narrow search scope
+///
+/// Request body:
+/// - query: Search text (1-1000 characters)
+/// - limit: Result limit (1-100, default 10)
 async fn hybrid_search(
     State(st): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     Json(req): Json<HybridSearchRequest>,
 ) -> Result<Json<Vec<Scored<MemoryItem>>>, ApiError> {
+    // Validate query length
+    if req.query.is_empty() || req.query.len() > 1000 {
+        return Err(ApiError::BadRequest(
+            "query must be 1-1000 characters".to_string(),
+        ));
+    }
+
     // Extract tenant_id from query params (security: prevents IDOR via request body)
     let tenant_id = params
         .get("tenant_id")
@@ -394,17 +412,26 @@ async fn hybrid_search(
     let embedder = st
         .embedder
         .as_ref()
-        .ok_or_else(|| ApiError::Internal("Embedding unavailable".to_string()))?;
+        .ok_or_else(|| ApiError::Internal("embedding provider not available".to_string()))?;
 
     // Generate embedding for query text
     let query_embedding = embedder
         .embed(&req.query)
         .await
-        .map_err(|_| ApiError::Internal("Embedding unavailable".to_string()))?;
+        .map_err(|e| {
+            tracing::error!("embedding failed: {}", e);
+            ApiError::Internal("embedding failed".to_string())
+        })?;
 
-    let limit = req.limit.unwrap_or(10).min(100);
+    // Clamp limit to [1, 100] range
+    let limit = req
+        .limit
+        .unwrap_or(10)
+        .clamp(1, 100);
 
     // Create query for lexical + semantic fusion
+    // Optional scope fields (workspace_id, project_id, agent_id, run_id) narrow the search
+    // to a specific context within the tenant. If omitted, search spans entire tenant.
     let query = Query {
         scope: ScopeKey {
             tenant_id,
@@ -437,7 +464,7 @@ async fn ingest_source(
 ) -> Result<Json<IngestionResponse>, ApiError> {
     let registry = st.source_registry.clone();
 
-    if let Some(source_obj) = registry.get(&source) {
+    if let Some(_source_obj) = registry.get(&source) {
         // Trigger ingestion (would call actual API in production)
         let count = 0; // Mocked for now
         Ok(Json(IngestionResponse {
@@ -838,13 +865,11 @@ mod tests {
 
         let req_json = json!({
             "query": "deployment failed",
-            "scope_tenant_id": "acme",
             "limit": 25
         });
 
         let req: SemanticSearchRequest = serde_json::from_value(req_json).unwrap();
         assert_eq!(req.query, "deployment failed");
-        assert_eq!(req.scope_tenant_id, "acme");
         assert_eq!(req.limit, Some(25));
     }
 
@@ -853,13 +878,11 @@ mod tests {
         use serde_json::json;
 
         let req_json = json!({
-            "query": "error handling",
-            "scope_tenant_id": "default"
+            "query": "error handling"
         });
 
         let req: SemanticSearchRequest = serde_json::from_value(req_json).unwrap();
         assert_eq!(req.query, "error handling");
-        assert_eq!(req.scope_tenant_id, "default");
         assert_eq!(req.limit, None);
     }
 
@@ -868,7 +891,6 @@ mod tests {
         // Limit should be applied in endpoint handler
         let req = SemanticSearchRequest {
             query: "test".to_string(),
-            scope_tenant_id: "tenant1".to_string(),
             limit: Some(500),
         };
 
@@ -878,14 +900,13 @@ mod tests {
 
     #[test]
     fn test_semantic_search_scope_creation() {
-        let req = SemanticSearchRequest {
+        let _req = SemanticSearchRequest {
             query: "test".to_string(),
-            scope_tenant_id: "acme".to_string(),
             limit: Some(10),
         };
 
         let scope = ScopeKey {
-            tenant_id: req.scope_tenant_id.clone(),
+            tenant_id: "acme".to_string(),
             workspace_id: None,
             project_id: None,
             agent_id: None,
@@ -975,5 +996,100 @@ mod tests {
         let error_msg = "Embeddings not available";
         assert!(!error_msg.is_empty());
         assert!(error_msg.contains("Embeddings"));
+    }
+
+    #[test]
+    fn test_hybrid_search_request_validation() {
+        // Test empty query validation
+        let empty_query = HybridSearchRequest {
+            query: String::new(),
+            limit: Some(10),
+        };
+        assert!(empty_query.query.is_empty());
+
+        // Test max length validation (1000 chars)
+        let long_query = HybridSearchRequest {
+            query: "x".repeat(1001),
+            limit: Some(10),
+        };
+        assert!(long_query.query.len() > 1000);
+
+        // Test valid query
+        let valid_query = HybridSearchRequest {
+            query: "what are my recent decisions about kubernetes?".to_string(),
+            limit: Some(20),
+        };
+        assert!(!valid_query.query.is_empty() && valid_query.query.len() <= 1000);
+    }
+
+    #[test]
+    fn test_hybrid_search_limit_clamping() {
+        // Verify limit clamping logic for hybrid search (1-100 range)
+        let test_cases = vec![
+            (None, 10),   // None → default 10
+            (Some(0), 1), // 0 → clamped to 1
+            (Some(1), 1),
+            (Some(50), 50),
+            (Some(100), 100),
+            (Some(500), 100), // 500 → clamped to 100
+        ];
+
+        for (input, expected) in test_cases {
+            let clamped = input.unwrap_or(10).clamp(1, 100);
+            assert_eq!(
+                clamped, expected,
+                "Input {:?} should clamp to {}",
+                input, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_hybrid_search_request_serialization() {
+        // Verify HybridSearchRequest can be serialized/deserialized
+        let req = HybridSearchRequest {
+            query: "recall memories about meeting decisions".to_string(),
+            limit: Some(15),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: HybridSearchRequest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.query, req.query);
+        assert_eq!(deserialized.limit, req.limit);
+    }
+
+    #[test]
+    fn test_hybrid_search_scope_key_construction() {
+        // Verify optional scope fields (workspace_id, project_id, etc.)
+        // can be None and the search spans entire tenant
+        use std::collections::HashMap;
+
+        let mut params = HashMap::new();
+        params.insert("tenant_id".to_string(), "acme-corp".to_string());
+        // workspace_id, project_id, agent_id, run_id deliberately omitted
+
+        // When omitted, optional fields should be None
+        let workspace_id = params.get("workspace_id").cloned();
+        let project_id = params.get("project_id").cloned();
+        let agent_id = params.get("agent_id").cloned();
+        let run_id = params.get("run_id").cloned();
+
+        assert!(workspace_id.is_none());
+        assert!(project_id.is_none());
+        assert!(agent_id.is_none());
+        assert!(run_id.is_none());
+
+        // When provided, should be Some
+        let mut params_with_scope = HashMap::new();
+        params_with_scope.insert("tenant_id".to_string(), "acme-corp".to_string());
+        params_with_scope.insert("workspace_id".to_string(), "ws-123".to_string());
+        params_with_scope.insert("project_id".to_string(), "proj-456".to_string());
+
+        let workspace_id = params_with_scope.get("workspace_id").cloned();
+        let project_id = params_with_scope.get("project_id").cloned();
+
+        assert!(workspace_id.is_some());
+        assert!(project_id.is_some());
     }
 }

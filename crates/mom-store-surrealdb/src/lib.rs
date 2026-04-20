@@ -14,6 +14,7 @@ pub mod hybrid;
 
 pub use hybrid::{HybridConfig, RankedResult};
 
+#[allow(dead_code)]
 pub struct SurrealDBStore {
     db: Arc<Surreal<Db>>,
     namespace: String,
@@ -531,7 +532,7 @@ async fn semantic_recall(
     }
 
     // Order by created_at_ms for stable ordering before similarity computation
-    query_str.push_str(&format!(" ORDER BY created_at_ms DESC LIMIT 1000"));
+    query_str.push_str(" ORDER BY created_at_ms DESC LIMIT 1000");
 
     let results: Vec<StoredItem> = db.query(&query_str).await?.take(0)?;
 

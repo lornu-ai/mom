@@ -120,9 +120,9 @@ pub trait MemoryStore: Send + Sync {
     /// Vector-based semantic search (Phase 2)
     async fn vector_recall(
         &self,
-        query_embedding: &[f32],
-        scope: &ScopeKey,
-        limit: usize,
+        _query_embedding: &[f32],
+        _scope: &ScopeKey,
+        _limit: usize,
     ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
         // Default implementation returns empty - implementations can override
         Ok(Vec::new())
@@ -131,9 +131,9 @@ pub trait MemoryStore: Send + Sync {
     /// Hybrid recall combining lexical + semantic search with RRF fusion (Phase 2)
     async fn hybrid_recall(
         &self,
-        q: Query,
-        query_embedding: &[f32],
-        limit: usize,
+        _q: Query,
+        _query_embedding: &[f32],
+        _limit: usize,
     ) -> anyhow::Result<Vec<Scored<MemoryItem>>> {
         // Default implementation returns empty - implementations can override
         Ok(Vec::new())

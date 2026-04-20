@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn test_deletion_with_empty_vs_populated_tags() {
         // Items with empty tags can be deleted
-        let mut empty_tags = create_basic_item("empty-tags", MemoryKind::Event);
+        let empty_tags = create_basic_item("empty-tags", MemoryKind::Event);
         assert_eq!(empty_tags.tags.len(), 0);
 
         // Items with tags can be deleted
@@ -1019,9 +1019,9 @@ mod tests {
     #[test]
     fn test_ingestion_sources_are_unique() {
         // Verify each source has unique identifiers
-        let sources = vec!["oxidizedrag", "oxidizedgraph", "datafabric"];
+        let sources = ["oxidizedrag", "oxidizedgraph", "datafabric"];
 
-        let unique_sources: std::collections::HashSet<_> = sources.iter().cloned().collect();
+        let unique_sources: std::collections::HashSet<_> = sources.iter().copied().collect();
         assert_eq!(
             unique_sources.len(),
             3,
